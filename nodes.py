@@ -224,24 +224,6 @@ _SPECTRUM_INPUTS = {
             "tooltip": "Ridge regression regularization strength.",
         },
     ),
-    "stop_caching_step": (
-        "INT",
-        {
-            "default": -1,
-            "min": -1,
-            "max": 10000,
-            "tooltip": (
-                "Step index at which caching stops — remaining steps always run "
-                "actual forwards for final refinement. "
-                "-1 = auto: schedule-aware. Simple keeps steps-3 (full speedup); "
-                "uniform-tail schedules (karras / exp / kl_optimal) push earlier "
-                "(steps-5..-8) to dilute accumulated drift. "
-                "Lower = more late-stage actual forwards (safer on detail-heavy "
-                "prompts). Higher = cache further into the tail (more speedup, "
-                "may blur fine detail)."
-            ),
-        },
-    ),
 }
 
 _SPECTRUM_DEFAULTS = dict(
@@ -251,7 +233,6 @@ _SPECTRUM_DEFAULTS = dict(
     blend_w=0.3,
     cheby_degree=3,
     ridge_lambda=0.1,
-    stop_caching_step=-1,
 )
 
 
@@ -421,7 +402,6 @@ class SpectrumKSamplerAdvanced:
         blend_w=0.3,
         cheby_degree=3,
         ridge_lambda=0.1,
-        stop_caching_step=-1,
     ):
         m = model.clone()
         setup_mod_guidance(
@@ -455,7 +435,6 @@ class SpectrumKSamplerAdvanced:
             blend_w=blend_w,
             cheby_degree=cheby_degree,
             ridge_lambda=ridge_lambda,
-            stop_caching_step=stop_caching_step,
         )
 
 
