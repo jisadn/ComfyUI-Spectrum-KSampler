@@ -63,16 +63,24 @@ Per-block guidance schedules address quality drift on LoRAs whose distribution s
 
 ## DCW post-step bias correction
 
-All three nodes expose a `dcw_lambda` widget that toggles **DCW** ([Yu et al., CVPR 2026](https://arxiv.org/abs/2604.16044)), a sampler-level post-step correction for the SNR-t bias of flow-matching DiTs. Each step's `prev_sample` is mixed toward (or away from) the post-CFG `x0_pred`:
+All three nodes expose `dcw_lambda` and `dcw_band_mask` widgets that toggle **DCW** ([Yu et al., CVPR 2026](https://arxiv.org/abs/2604.16044)), a sampler-level post-step correction for the SNR-t bias of flow-matching DiTs. Each step's `prev_sample` is mixed toward (or away from) the post-CFG `x0_pred`, optionally restricted to a single-level Haar subband of the differential:
 
 ```
-x_{i+1} += λ · (1 − σ_i) · (x_{i+1} − x0_pred_i)
+diff           = x_{i+1} − x0_pred_i
+diff_masked    = haar_idwt(mask(haar_dwt(diff)))   # band restriction
+x_{i+1}       += λ · (1 − σ_i) · diff_masked
 ```
 
 | `dcw_lambda` | Behavior |
 |---|---|
-| `-0.010` (default) | Closes Anima's late-step velocity-norm gap. **Negative** — opposite-sign from the paper's setting; see `bench/dcw/findings.md` in anima_lora for why. |
+| `-0.015` (default) | Tuned for `dcw_band_mask = LL` — closes ≈42% of Anima's late-half integrated \|gap\|. **Negative** — opposite-sign from the paper's setting; see `docs/methods/dcw.md` in anima_lora for why. |
 | `0.0` | Disabled — no overhead, no extra hooks registered. |
 | Positive values | Match the paper's direction. On Anima these *widen* the bias and over-smooth output. |
 
-The schedule is fixed to `one_minus_sigma` (correction concentrates at low σ where Anima's bias is largest). Implementation is sampler-agnostic — DCW mutates the latent at the step boundary via a `CALC_COND_BATCH` wrapper plus a post-CFG capture hook, so it composes correctly with Euler / ER-SDE / DPM++ / etc., with CFG on or off, and stacks cleanly on top of Spectrum + mod guidance.
+| `dcw_band_mask` | Behavior |
+|---|---|
+| `LL` (default) | Restrict correction to the Haar low-low subband. Strictly better than broadband on Anima — improves all four bands while broadband worsens the detail bands (LH/HL/HH). LL is the upstream causal lever; detail bands are downstream symptoms. |
+| `all` | Paper-form broadband correction. Falls through to the cheap fused `add_` (no DWT round-trip). Pair with `dcw_lambda ≈ -0.010` if you switch to this. |
+| `HH`, `LH+HL+HH` | Ablation modes. `HH`-only is empirically dead; `LH+HL+HH` pulled in for completeness. |
+
+The schedule is fixed to `one_minus_sigma` (correction concentrates at low σ where Anima's bias is largest). Implementation is sampler-agnostic — DCW mutates the latent at the step boundary via a `CALC_COND_BATCH` wrapper plus a post-CFG capture hook, so it composes correctly with Euler / ER-SDE / DPM++ / etc., with CFG on or off, and stacks cleanly on top of Spectrum + mod guidance. The DWT/iDWT round-trip on `LL` mode is one pass over the latent (negligible vs the DiT forward).
