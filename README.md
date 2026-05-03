@@ -60,3 +60,19 @@ The default ~12MB `pooled_text_proj` weight is auto-downloaded on first use from
 | `mod_final_w` (advanced) | 0.0 | `w` applied at `final_layer`. `0` = don't disturb the output head |
 
 Per-block guidance schedules address quality drift on LoRAs whose distribution sits far from the positive-prompt axis (e.g. early blocks blowing out tonal DC into uniform color collapse). The default `step_i8_skip27` protects blocks 0–7 and the final compensation block 27 from the steering delta while keeping the base text projection uniform across all blocks. See `docs/mod-guidance.md` in the anima_lora repo for the underlying rationale.
+
+## DCW post-step bias correction
+
+All three nodes expose a `dcw_lambda` widget that toggles **DCW** ([Yu et al., CVPR 2026](https://arxiv.org/abs/2604.16044)), a sampler-level post-step correction for the SNR-t bias of flow-matching DiTs. Each step's `prev_sample` is mixed toward (or away from) the post-CFG `x0_pred`:
+
+```
+x_{i+1} += λ · (1 − σ_i) · (x_{i+1} − x0_pred_i)
+```
+
+| `dcw_lambda` | Behavior |
+|---|---|
+| `-0.010` (default) | Closes Anima's late-step velocity-norm gap. **Negative** — opposite-sign from the paper's setting; see `bench/dcw/findings.md` in anima_lora for why. |
+| `0.0` | Disabled — no overhead, no extra hooks registered. |
+| Positive values | Match the paper's direction. On Anima these *widen* the bias and over-smooth output. |
+
+The schedule is fixed to `one_minus_sigma` (correction concentrates at low σ where Anima's bias is largest). Implementation is sampler-agnostic — DCW mutates the latent at the step boundary via a `CALC_COND_BATCH` wrapper plus a post-CFG capture hook, so it composes correctly with Euler / ER-SDE / DPM++ / etc., with CFG on or off, and stacks cleanly on top of Spectrum + mod guidance.

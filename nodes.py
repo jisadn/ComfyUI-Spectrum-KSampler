@@ -235,6 +235,28 @@ _SPECTRUM_DEFAULTS = dict(
     ridge_lambda=0.1,
 )
 
+# DCW: SNR-t bias correction (arXiv:2604.16044). Anima form, λ < 0,
+# schedule fixed to one_minus_sigma. See anima_lora/bench/dcw/findings.md.
+_DCW_INPUTS = {
+    "dcw_lambda": (
+        "FLOAT",
+        {
+            "default": -0.010,
+            "min": -1.0,
+            "max": 1.0,
+            "step": 0.001,
+            "round": 0.0001,
+            "tooltip": (
+                "DCW post-step bias correction strength. 0.0 = disabled. "
+                "Default -0.010 closes Anima's late-step velocity-norm gap "
+                "(negative — see anima_lora bench/dcw/findings.md). "
+                "Schedule fixed to one_minus_sigma. Composes with Spectrum + "
+                "mod guidance; sampler-agnostic."
+            ),
+        },
+    ),
+}
+
 
 # ---------------------------------------------------------------------------
 # Nodes
@@ -246,7 +268,7 @@ class SpectrumKSampler:
 
     @classmethod
     def INPUT_TYPES(cls):
-        return {"required": dict(_KSAMPLER_INPUTS)}
+        return {"required": {**_KSAMPLER_INPUTS, **_DCW_INPUTS}}
 
     RETURN_TYPES = ("LATENT",)
     FUNCTION = "sample"
@@ -269,6 +291,7 @@ class SpectrumKSampler:
         negative,
         latent_image,
         denoise=1.0,
+        dcw_lambda=-0.010,
     ):
         return spectrum_sample(
             model,
@@ -282,6 +305,7 @@ class SpectrumKSampler:
             latent_image,
             denoise,
             **_SPECTRUM_DEFAULTS,
+            dcw_lambda=dcw_lambda,
         )
 
 
@@ -290,7 +314,7 @@ class SpectrumKSamplerModGuidance:
 
     @classmethod
     def INPUT_TYPES(cls):
-        return {"required": {**_KSAMPLER_INPUTS, **_MOD_GUIDANCE_SIMPLE_INPUTS}}
+        return {"required": {**_KSAMPLER_INPUTS, **_MOD_GUIDANCE_SIMPLE_INPUTS, **_DCW_INPUTS}}
 
     RETURN_TYPES = ("LATENT",)
     FUNCTION = "sample"
@@ -320,6 +344,7 @@ class SpectrumKSamplerModGuidance:
         quality_tags,
         mod_w_profile,
         denoise=1.0,
+        dcw_lambda=-0.010,
     ):
         profile = MOD_W_PROFILES.get(mod_w_profile) or MOD_W_PROFILES[DEFAULT_MOD_W_PROFILE]
         m = model.clone()
@@ -349,6 +374,7 @@ class SpectrumKSamplerModGuidance:
             latent_image,
             denoise,
             **_SPECTRUM_DEFAULTS,
+            dcw_lambda=dcw_lambda,
         )
 
 
@@ -362,6 +388,7 @@ class SpectrumKSamplerAdvanced:
                 **_KSAMPLER_INPUTS,
                 **_mod_guidance_advanced_inputs(),
                 **_SPECTRUM_INPUTS,
+                **_DCW_INPUTS,
             }
         }
 
@@ -402,6 +429,7 @@ class SpectrumKSamplerAdvanced:
         blend_w=0.3,
         cheby_degree=3,
         ridge_lambda=0.1,
+        dcw_lambda=-0.010,
     ):
         m = model.clone()
         setup_mod_guidance(
@@ -435,6 +463,7 @@ class SpectrumKSamplerAdvanced:
             blend_w=blend_w,
             cheby_degree=cheby_degree,
             ridge_lambda=ridge_lambda,
+            dcw_lambda=dcw_lambda,
         )
 
 

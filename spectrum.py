@@ -8,11 +8,76 @@ import torch
 
 import comfy.sample
 import comfy.utils
+import comfy.patcher_extension
 import latent_preview
 
 from .forecaster import SpectrumPredictor
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# DCW: post-step SNR-t bias correction (arXiv:2604.16044). Anima form, λ < 0,
+# schedule fixed to one_minus_sigma. See anima_lora/bench/dcw/findings.md.
+#
+# Applied via two coordinated hooks:
+#   1) CALC_COND_BATCH wrapper — mutates x_in in-place at each new-step boundary
+#      using the previous step's cached post-CFG denoised. x_in IS the sampler's
+#      `x` reference (passed all the way down from KSamplerX0Inpaint), so the
+#      Euler/ER-SDE/DPM step that follows operates on the corrected latent.
+#   2) sampler_post_cfg_function — captures the post-CFG denoised after each
+#      step for use by (1) on the next step.
+# ---------------------------------------------------------------------------
+
+
+class DCWState:
+    def __init__(self, lam: float, schedule: str = "one_minus_sigma"):
+        self.lam = lam
+        self.schedule = schedule
+        self.last_denoised: Optional[torch.Tensor] = None
+        self.curr_sigma: Optional[float] = None
+
+    def schedule_value(self, sigma_i: Optional[float]) -> float:
+        if sigma_i is None:
+            return 0.0
+        if self.schedule == "one_minus_sigma":
+            return 1.0 - sigma_i
+        if self.schedule == "sigma_i":
+            return sigma_i
+        if self.schedule == "const":
+            return 1.0
+        return 0.0  # "none"
+
+
+def _make_dcw_calc_cond_batch_wrapper(state: DCWState):
+    def wrapper(executor, model, conds, x_in, timestep, model_options):
+        # In flow-matching / CONST model_sampling, timestep == sigma.
+        sigma = float(timestep[0]) if timestep.ndim else float(timestep)
+        new_step = (
+            state.curr_sigma is None or abs(sigma - state.curr_sigma) > 1e-8
+        )
+        if new_step:
+            if state.last_denoised is not None and state.lam != 0.0:
+                s = state.lam * state.schedule_value(state.curr_sigma)
+                if s != 0.0:
+                    # In-place: x_in ← x_in + s · (x_in − last_denoised).
+                    # x_in IS the sampler's tensor; this propagates to the
+                    # Euler/ER-SDE step that runs after the model returns.
+                    x_in.add_(x_in - state.last_denoised, alpha=s)
+            state.curr_sigma = sigma
+        return executor(model, conds, x_in, timestep, model_options)
+
+    return wrapper
+
+
+def _make_dcw_post_cfg_hook(state: DCWState):
+    def hook(args):
+        # args["denoised"] is post-CFG x0_pred. Clone so the cache survives
+        # downstream in-place ops on the sampler's tensors.
+        state.last_denoised = args["denoised"].clone()
+        return args["denoised"]
+
+    return hook
 
 
 def _spectrum_fast_forward(
@@ -122,9 +187,27 @@ def spectrum_sample(
     blend_w,
     cheby_degree,
     ridge_lambda,
+    dcw_lambda: float = -0.010,
+    dcw_schedule: str = "one_minus_sigma",
 ):
-    """Shared Spectrum sampling logic used by all node tiers."""
+    """Shared Spectrum sampling logic used by all node tiers.
+
+    dcw_lambda: DCW bias-correction strength. 0.0 = disabled. Default -0.010
+        closes Anima's late-step velocity-norm gap (negative — opposite-sign
+        from the paper). See anima_lora/bench/dcw/findings.md.
+    """
     m = model.clone()
+
+    # DCW: register CALC_COND_BATCH wrapper + post-CFG hook only when enabled.
+    if dcw_lambda != 0.0:
+        dcw_state = DCWState(lam=dcw_lambda, schedule=dcw_schedule)
+        comfy.patcher_extension.add_wrapper(
+            comfy.patcher_extension.WrappersMP.CALC_COND_BATCH,
+            _make_dcw_calc_cond_batch_wrapper(dcw_state),
+            m.model_options,
+            is_model_options=True,
+        )
+        m.set_model_sampler_post_cfg_function(_make_dcw_post_cfg_hook(dcw_state))
 
     state = SpectrumState(
         window_size=window_size,
