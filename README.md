@@ -2,6 +2,8 @@
 
 Training-free diffusion sampling acceleration via **Chebyshev polynomial feature forecasting** ([Han et al., CVPR 2026](https://arxiv.org/abs/2603.01623)). Drop-in KSampler replacement that skips transformer blocks on predicted steps for ~2-3x speedup.
 
+Tuned for the [Anima](https://github.com/sorryhyun/anima_lora) DiT — its modulation guidance, DCW calibrator artifacts, and per-block guidance presets are derived from the Anima training/inference pipeline. See the [anima_lora repo](https://github.com/sorryhyun/anima_lora) for the underlying methods documentation (`docs/methods/dcw.md`, `docs/methods/mod-guidance.md`, `docs/methods/spectrum.md`).
+
 ## How it works
 
 Standard diffusion runs the full DiT (all transformer blocks) at every denoising step. Spectrum observes that block outputs are smooth functions of the timestep, so most steps can be **predicted** instead of computed.
@@ -51,7 +53,7 @@ The default ~12MB `pooled_text_proj` weight is auto-downloaded on first use from
 | `clip` | — | CLIP encoder for encoding quality tags |
 | `adapter` | `(auto-download default)` | `pooled_text_proj` safetensors file (advanced node only) |
 | `quality_tags` | `absurdres, highres, masterpiece, ...` | Quality/aesthetic tags to steer toward |
-| `mod_w_profile` (simple) | `step_i8_skip27` | Per-block guidance preset. `step_i8_skip27` (default, best quality) protects blocks 0–7 + 27 and applies `w=3` to blocks 8–26. `step_i14` is the safe option — use it when a LoRA shows anatomy drift. `uniform_w3` recovers pre-0413 legacy behavior. |
+| `mod_w_profile` (simple) | `step_i8_skip27` | Per-block guidance preset. `off` disables modulation guidance entirely (no adapter download, no extra hook). `step_i8_skip27` (default, best quality) protects blocks 0–7 + 27 and applies `w=3` to blocks 8–26. `step_i14` is the safe option — use it when a LoRA shows anatomy drift. `uniform_w3` recovers pre-0413 legacy behavior. |
 | `mod_w` (advanced) | 3.0 | Peak guidance strength applied per-block |
 | `mod_start_layer` (advanced) | 8 | First block (inclusive) that receives the steering delta. `0` = uniform legacy behavior |
 | `mod_end_layer` (advanced) | -1 | Last block + 1 (exclusive). `-1` = all remaining blocks. Set to `27` to skip Anima's compensation block |
@@ -59,11 +61,13 @@ The default ~12MB `pooled_text_proj` weight is auto-downloaded on first use from
 | `mod_taper_scale` (advanced) | 0.25 | Multiplier for tapered slots |
 | `mod_final_w` (advanced) | 0.0 | `w` applied at `final_layer`. `0` = don't disturb the output head |
 
-Per-block guidance schedules address quality drift on LoRAs whose distribution sits far from the positive-prompt axis (e.g. early blocks blowing out tonal DC into uniform color collapse). The default `step_i8_skip27` protects blocks 0–7 and the final compensation block 27 from the steering delta while keeping the base text projection uniform across all blocks. See `docs/mod-guidance.md` in the anima_lora repo for the underlying rationale.
+Per-block guidance schedules address quality drift on LoRAs whose distribution sits far from the positive-prompt axis (e.g. early blocks blowing out tonal DC into uniform color collapse). The default `step_i8_skip27` protects blocks 0–7 and the final compensation block 27 from the steering delta while keeping the base text projection uniform across all blocks. See [`docs/methods/mod-guidance.md`](https://github.com/sorryhyun/anima_lora/blob/main/docs/methods/mod-guidance.md) in anima_lora for the underlying rationale.
 
 ## DCW post-step bias correction
 
-All three nodes expose `dcw_lambda` and `dcw_band_mask` widgets that toggle **DCW** ([Yu et al., CVPR 2026](https://arxiv.org/abs/2604.16044)), a sampler-level post-step correction for the SNR-t bias of flow-matching DiTs. Each step's `prev_sample` is mixed toward (or away from) the post-CFG `x0_pred`, optionally restricted to a single-level Haar subband of the differential:
+The simple nodes (**KSampler (Spectrum)** and **KSampler (Spectrum + Mod Guidance)**) expose a single `dcw` on/off toggle — `on` runs auto mode (per-prompt λ̂ from the OnlineDCWCalibrator fusion head, auto-downloaded on first use); `off` disables correction. The **Advanced** node exposes the full `dcw_mode` / `dcw_lambda` / `dcw_band_mask` / `dcw_calibrator` widgets for manual mode + custom artifacts.
+
+DCW ([Yu et al., CVPR 2026](https://arxiv.org/abs/2604.16044)) is a sampler-level post-step correction for the SNR-t bias of flow-matching DiTs. Each step's `prev_sample` is mixed toward (or away from) the post-CFG `x0_pred`, optionally restricted to a single-level Haar subband of the differential:
 
 ```
 diff           = x_{i+1} − x0_pred_i
@@ -73,14 +77,17 @@ x_{i+1}       += λ · (1 − σ_i) · diff_masked
 
 | `dcw_lambda` | Behavior |
 |---|---|
-| `-0.015` (default) | Tuned for `dcw_band_mask = LL` — closes ≈42% of Anima's late-half integrated \|gap\|. **Negative** — opposite-sign from the paper's setting; see `docs/methods/dcw.md` in anima_lora for why. |
+| `+0.01` (default) | Tuned for `dcw_band_mask = LL` at **CFG ≥ ~2** with non-square aspects. Positive (paper-direction) — recovers detail at non-square aspects without smoothing. |
+| `-0.015` | Use at **CFG = 1 / 1024²**, where the bias direction flips and the paper-opposite sign applies. |
 | `0.0` | Disabled — no overhead, no extra hooks registered. |
-| Positive values | Match the paper's direction. On Anima these *widen* the bias and over-smooth output. |
+| Auto mode | Predicts a per-prompt λ̂ from the fusion head; ignores this widget. Tuned at CFG=4 — at CFG ≈ 1 prefer manual + `-0.015`. |
+
+The bias direction is **(CFG × aspect)-dependent**. Default `+0.01` is the verified hyperparam for the common case (CFG=4, non-square). At CFG=1 / 1024² the optimal sign flips — drop to `-0.015` manually, or stick with auto if CFG ≥ ~2.
 
 | `dcw_band_mask` | Behavior |
 |---|---|
 | `LL` (default) | Restrict correction to the Haar low-low subband. Strictly better than broadband on Anima — improves all four bands while broadband worsens the detail bands (LH/HL/HH). LL is the upstream causal lever; detail bands are downstream symptoms. |
-| `all` | Paper-form broadband correction. Falls through to the cheap fused `add_` (no DWT round-trip). Pair with `dcw_lambda ≈ -0.010` if you switch to this. |
+| `all` | Paper-form broadband correction. Falls through to the cheap fused `add_` (no DWT round-trip). Pair with a smaller \|λ\| if you switch to this. |
 | `HH`, `LH+HL+HH` | Ablation modes. `HH`-only is empirically dead; `LH+HL+HH` pulled in for completeness. |
 
 The schedule is fixed to `one_minus_sigma` (correction concentrates at low σ where Anima's bias is largest). Implementation is sampler-agnostic — DCW mutates the latent at the step boundary via a `CALC_COND_BATCH` wrapper plus a post-CFG capture hook, so it composes correctly with Euler / ER-SDE / DPM++ / etc., with CFG on or off, and stacks cleanly on top of Spectrum + mod guidance. The DWT/iDWT round-trip on `LL` mode is one pass over the latent (negligible vs the DiT forward).

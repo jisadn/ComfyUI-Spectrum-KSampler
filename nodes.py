@@ -59,6 +59,7 @@ _QUALITY_TAGS_INPUT = (
 # Per-block guidance profiles. Each maps to a fixed (w, start, end, taper, taper_scale, final_w)
 # tuple — see docs/mod-guidance.md for the naming + rationale.
 # end_layer = -1 means "all blocks" (resolved against num_blocks at setup time).
+MOD_W_PROFILE_OFF = "off"
 MOD_W_PROFILES = {
     "step_i8_skip27": dict(w=3.0, start_layer=8,  end_layer=27, taper=0, taper_scale=0.25, final_w=0.0),
     "step_i14":       dict(w=3.0, start_layer=14, end_layer=-1, taper=0, taper_scale=0.25, final_w=0.0),
@@ -71,11 +72,12 @@ _MOD_GUIDANCE_SIMPLE_INPUTS = {
     "clip": ("CLIP", {"tooltip": "CLIP encoder for encoding positive quality tags."}),
     "quality_tags": _QUALITY_TAGS_INPUT,
     "mod_w_profile": (
-        list(MOD_W_PROFILES.keys()),
+        [MOD_W_PROFILE_OFF] + list(MOD_W_PROFILES.keys()),
         {
             "default": DEFAULT_MOD_W_PROFILE,
             "tooltip": (
                 "Per-block guidance schedule preset. "
+                "'off' disables modulation guidance entirely (no adapter download, no extra hook). "
                 "'step_i8_skip27' (default) protects early tonal-DC blocks 0–7 and the "
                 "final compensation block 27, applying w=3 to blocks 8–26 — best overall "
                 "quality but can occasionally show minor anatomy drift on drift-prone LoRAs. "
@@ -245,6 +247,26 @@ _SPECTRUM_DEFAULTS = dict(
 
 # DCW: SNR-t bias correction (arXiv:2604.16044). Anima form, λ < 0,
 # schedule fixed to one_minus_sigma. See anima_lora/docs/methods/dcw.md.
+
+# Simple on/off toggle for the basic nodes — "on" maps to auto mode
+# (OnlineDCWCalibrator fusion head, auto-downloaded on first use). Manual mode,
+# custom λ, band, or calibrator override live on the Advanced node only.
+_DCW_SIMPLE_INPUTS = {
+    "dcw": (
+        ["on", "off"],
+        {
+            "default": "on",
+            "tooltip": (
+                "DCW post-step bias correction. 'on' uses auto mode "
+                "(per-prompt λ̂ from the OnlineDCWCalibrator fusion head, "
+                "auto-downloaded on first use). 'off' disables correction. "
+                "For manual mode, custom λ / band / calibrator override use "
+                "the Advanced node."
+            ),
+        },
+    ),
+}
+
 _DCW_INPUTS = {
     "dcw_mode": (
         ["off", "manual", "auto"],
@@ -321,12 +343,11 @@ class SpectrumKSampler:
     @classmethod
     def INPUT_TYPES(cls):
         # `clip` is required so auto-DCW can recover post-LLM-adapter c_pool.
-        # Manual / off modes don't use it but the slot stays connected.
         return {
             "required": {
                 **_KSAMPLER_INPUTS,
                 "clip": ("CLIP", {"tooltip": "CLIP encoder (required for auto-DCW)."}),
-                **_DCW_INPUTS,
+                **_DCW_SIMPLE_INPUTS,
             }
         }
 
@@ -352,11 +373,9 @@ class SpectrumKSampler:
         latent_image,
         clip,
         denoise=1.0,
-        dcw_mode="manual",
-        dcw_lambda=0.01,
-        dcw_band_mask="LL",
-        dcw_calibrator=AUTO_CALIBRATOR_SENTINEL,
+        dcw="on",
     ):
+        dcw_mode = "auto" if dcw == "on" else "off"
         return spectrum_sample(
             model,
             seed,
@@ -370,9 +389,9 @@ class SpectrumKSampler:
             denoise,
             **_SPECTRUM_DEFAULTS,
             dcw_mode=dcw_mode,
-            dcw_lambda=dcw_lambda,
-            dcw_band_mask=dcw_band_mask,
-            dcw_calibrator=dcw_calibrator,
+            dcw_lambda=0.01,
+            dcw_band_mask="LL",
+            dcw_calibrator=AUTO_CALIBRATOR_SENTINEL,
             clip=clip,
         )
 
@@ -382,7 +401,7 @@ class SpectrumKSamplerModGuidance:
 
     @classmethod
     def INPUT_TYPES(cls):
-        return {"required": {**_KSAMPLER_INPUTS, **_MOD_GUIDANCE_SIMPLE_INPUTS, **_DCW_INPUTS}}
+        return {"required": {**_KSAMPLER_INPUTS, **_MOD_GUIDANCE_SIMPLE_INPUTS, **_DCW_SIMPLE_INPUTS}}
 
     RETURN_TYPES = ("LATENT",)
     FUNCTION = "sample"
@@ -394,7 +413,8 @@ class SpectrumKSamplerModGuidance:
         "pooled_text_proj adapter is auto-downloaded on first use. Quality "
         "tags are encoded through the full CLIP + LLM adapter pipeline for "
         "correct post-adapter pooling. Uses sensible Spectrum defaults and "
-        "the 'step_i8' per-block guidance schedule (early-DC protected)."
+        "the 'step_i8' per-block guidance schedule (early-DC protected). "
+        "Set mod_w_profile='off' to skip mod guidance entirely."
     )
 
     def sample(
@@ -412,27 +432,28 @@ class SpectrumKSamplerModGuidance:
         quality_tags,
         mod_w_profile,
         denoise=1.0,
-        dcw_mode="manual",
-        dcw_lambda=0.01,
-        dcw_band_mask="LL",
-        dcw_calibrator=AUTO_CALIBRATOR_SENTINEL,
+        dcw="on",
     ):
-        profile = MOD_W_PROFILES.get(mod_w_profile) or MOD_W_PROFILES[DEFAULT_MOD_W_PROFILE]
-        m = model.clone()
-        setup_mod_guidance(
-            m,
-            clip,
-            positive,
-            negative,
-            None,
-            quality_tags,
-            profile["w"],
-            start_layer=profile["start_layer"],
-            end_layer=profile["end_layer"],
-            taper=profile["taper"],
-            taper_scale=profile["taper_scale"],
-            final_w=profile["final_w"],
-        )
+        if mod_w_profile == MOD_W_PROFILE_OFF:
+            m = model
+        else:
+            profile = MOD_W_PROFILES.get(mod_w_profile) or MOD_W_PROFILES[DEFAULT_MOD_W_PROFILE]
+            m = model.clone()
+            setup_mod_guidance(
+                m,
+                clip,
+                positive,
+                negative,
+                None,
+                quality_tags,
+                profile["w"],
+                start_layer=profile["start_layer"],
+                end_layer=profile["end_layer"],
+                taper=profile["taper"],
+                taper_scale=profile["taper_scale"],
+                final_w=profile["final_w"],
+            )
+        dcw_mode = "auto" if dcw == "on" else "off"
         return spectrum_sample(
             m,
             seed,
@@ -446,9 +467,9 @@ class SpectrumKSamplerModGuidance:
             denoise,
             **_SPECTRUM_DEFAULTS,
             dcw_mode=dcw_mode,
-            dcw_lambda=dcw_lambda,
-            dcw_band_mask=dcw_band_mask,
-            dcw_calibrator=dcw_calibrator,
+            dcw_lambda=0.01,
+            dcw_band_mask="LL",
+            dcw_calibrator=AUTO_CALIBRATOR_SENTINEL,
             clip=clip,
         )
 
