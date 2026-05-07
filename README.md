@@ -65,7 +65,7 @@ Per-block guidance schedules address quality drift on LoRAs whose distribution s
 
 ## DCW post-step bias correction
 
-The simple nodes (**KSampler (Spectrum)** and **KSampler (Spectrum + Mod Guidance)**) expose a single `dcw` on/off toggle — `on` runs auto mode (per-prompt λ̂ from the OnlineDCWCalibrator fusion head, auto-downloaded on first use); `off` disables correction. The **Advanced** node exposes the full `dcw_mode` / `dcw_lambda` / `dcw_band_mask` / `dcw_calibrator` widgets for manual mode + custom artifacts.
+DCW defaults to **off** on every node — turn it on per-workflow when you want the correction. The simple nodes (**KSampler (Spectrum)** and **KSampler (Spectrum + Mod Guidance)**) expose a single `dcw` on/off toggle — `on` runs auto mode (per-prompt λ̂ from the OnlineDCWCalibrator fusion head, auto-downloaded on first use); `off` disables correction. The **Advanced** node exposes the full `dcw_mode` / `dcw_lambda` / `dcw_band_mask` / `dcw_calibrator` widgets for manual mode + custom artifacts.
 
 DCW ([Yu et al., CVPR 2026](https://arxiv.org/abs/2604.16044)) is a sampler-level post-step correction for the SNR-t bias of flow-matching DiTs. Each step's `prev_sample` is mixed toward (or away from) the post-CFG `x0_pred`, optionally restricted to a single-level Haar subband of the differential:
 

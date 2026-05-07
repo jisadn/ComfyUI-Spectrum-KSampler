@@ -255,7 +255,7 @@ _DCW_SIMPLE_INPUTS = {
     "dcw": (
         ["on", "off"],
         {
-            "default": "on",
+            "default": "off",
             "tooltip": (
                 "DCW post-step bias correction. 'on' uses auto mode "
                 "(per-prompt λ̂ from the OnlineDCWCalibrator fusion head, "
@@ -271,7 +271,7 @@ _DCW_INPUTS = {
     "dcw_mode": (
         ["off", "manual", "auto"],
         {
-            "default": "manual",
+            "default": "off",
             "tooltip": (
                 "DCW correction mode. "
                 "'off' disables correction entirely. "
@@ -373,7 +373,7 @@ class SpectrumKSampler:
         latent_image,
         clip,
         denoise=1.0,
-        dcw="on",
+        dcw="off",
     ):
         dcw_mode = "auto" if dcw == "on" else "off"
         return spectrum_sample(
@@ -525,7 +525,7 @@ class SpectrumKSamplerAdvanced:
         blend_w=0.3,
         cheby_degree=3,
         ridge_lambda=0.1,
-        dcw_mode="manual",
+        dcw_mode="off",
         dcw_lambda=0.01,
         dcw_band_mask="LL",
         dcw_calibrator=AUTO_CALIBRATOR_SENTINEL,
