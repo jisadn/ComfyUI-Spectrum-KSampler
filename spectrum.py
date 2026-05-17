@@ -5,6 +5,7 @@ import math
 from typing import Optional, Dict
 
 import torch
+import torch.nn.functional as F
 
 import comfy.sample
 import comfy.utils
@@ -15,6 +16,38 @@ from .dcw import install_dcw
 from .dcw_calibrator import setup_dcw_calibrator
 
 logger = logging.getLogger(__name__)
+
+# Anima DiT patches the latent with spatial_patch_size=2, so latent H/W must
+# be even (equivalently pixel H/W mod-16). Users picking odd-mod-32 pixel
+# sizes hit a PatchEmbed assertion deep inside the DiT — we pad bottom/right
+# before sampling and crop back after.
+_PATCH_MULTIPLE = 2
+_ODD_LATENT_WARNED = False
+
+
+def _pad_latent_to_patch_multiple(t: torch.Tensor, patch: int = _PATCH_MULTIPLE):
+    """Replicate-pad bottom/right of a 4-D latent to the next multiple of ``patch``.
+
+    Returns ``(padded, (H, W))`` where (H, W) are the original spatial dims.
+    The caller crops the sampled output back to (H, W) before returning to
+    the user.  Replicate (vs zero) padding minimises edge artifacts from the
+    bottom/right strip that is later cropped away.
+    """
+    H, W = t.shape[-2], t.shape[-1]
+    pad_h = (-H) % patch
+    pad_w = (-W) % patch
+    if pad_h == 0 and pad_w == 0:
+        return t, (H, W)
+    global _ODD_LATENT_WARNED
+    if not _ODD_LATENT_WARNED:
+        logger.warning(
+            "Spectrum: latent H,W=%d,%d is not divisible by %d "
+            "(Anima DiT patch_size). Padding to %d,%d and cropping the output "
+            "back. For exact framing, use pixel sizes that are multiples of %d.",
+            H, W, patch, H + pad_h, W + pad_w, patch * 8,
+        )
+        _ODD_LATENT_WARNED = True
+    return F.pad(t, (0, pad_w, 0, pad_h), mode="replicate"), (H, W)
 
 
 def _spectrum_fast_forward(
@@ -266,10 +299,19 @@ def spectrum_sample(
         m, latent_img, latent_image.get("downscale_ratio_spacial")
     )
 
+    # Pad to mod-2 latent (Anima DiT patch_size=2) before noise / sampling so
+    # odd-shape latents (mod-8 pixel but not mod-16) don't trip PatchEmbed.
+    latent_img, orig_hw = _pad_latent_to_patch_multiple(latent_img)
+    pad_h = latent_img.shape[-2] - orig_hw[0]
+    pad_w = latent_img.shape[-1] - orig_hw[1]
+
     batch_inds = latent_image.get("batch_index")
     noise = comfy.sample.prepare_noise(latent_img, seed, batch_inds)
 
     noise_mask = latent_image.get("noise_mask")
+    if noise_mask is not None and (pad_h or pad_w):
+        # Pad with ones so the appended strip denoises normally; we crop it off.
+        noise_mask = F.pad(noise_mask, (0, pad_w, 0, pad_h), mode="constant", value=1.0)
     callback = latent_preview.prepare_callback(m, steps)
     disable_pbar = not comfy.utils.PROGRESS_BAR_ENABLED
 
@@ -294,6 +336,9 @@ def spectrum_sample(
         dit.final_layer._spectrum_state = None
         if hasattr(dit, "_mod_pooled_proj"):
             del dit._mod_pooled_proj
+
+    if pad_h or pad_w:
+        samples = samples[..., : orig_hw[0], : orig_hw[1]].contiguous()
 
     if state.step_idx >= 0:
         if state.mode == "actual":
