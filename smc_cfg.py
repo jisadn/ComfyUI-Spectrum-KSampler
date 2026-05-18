@@ -65,6 +65,12 @@ def _make_smc_cfg_function(state: SMCCFGState):
     ``cond_scale``, ``sigma``, ``input``. In flow-matching / CONST
     model_sampling, ``v = (x_in − denoised) / σ`` and
     ``denoised = x_in − σ · v``.
+
+    ComfyUI's ``sampler_cfg_function`` contract: ``cfg_result = x − fn(args)``,
+    so we must return ``x − denoised_combined`` (a noise-residual-like
+    quantity), i.e. ``σ · v_out`` — NOT ``x − σ · v_out``. Returning the
+    denoised value here makes the sampler treat the noise residual as x₀
+    and the image collapses.
     """
     def cfg_function(args):
         cond_denoised = args.get("cond_denoised", args["cond"])
@@ -81,7 +87,7 @@ def _make_smc_cfg_function(state: SMCCFGState):
         v_cond = (x_in - cond_denoised) / sig
         v_uncond = (x_in - uncond_denoised) / sig
         v_out = state.combine_v(v_cond, v_uncond, cond_scale)
-        return x_in - sig * v_out
+        return sig * v_out
 
     return cfg_function
 
