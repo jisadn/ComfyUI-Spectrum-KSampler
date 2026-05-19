@@ -38,7 +38,7 @@ import torch
 
 
 class SMCCFGState:
-    def __init__(self, lam: float = 5.0, alpha: float = 0.2):
+    def __init__(self, lam: float = 5.0, alpha: float = 0.1):
         self.lam = float(lam)
         self.alpha = float(alpha)
         self._e_prev: Optional[torch.Tensor] = None

@@ -249,7 +249,7 @@ _SPECTRUM_DEFAULTS = dict(
 # Anima α-adaptive form — see anima_lora/docs/methods/smc_cfg.md). Replaces the
 # vanilla `uncond + w·(cond-uncond)` combine; no extra forwards. α=0 disables.
 _SMC_CFG_LAMBDA_DEFAULT = 5.0
-_SMC_CFG_ALPHA_DEFAULT = 0.2
+_SMC_CFG_ALPHA_DEFAULT = 0.1
 
 _SMC_CFG_ALPHA_INPUT = (
     "FLOAT",
