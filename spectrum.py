@@ -13,6 +13,13 @@ import comfy.samplers
 import comfy.utils
 import latent_preview
 
+try:
+    # Per-execution prompt_id — lets one_sampler_only re-arm on each fresh
+    # workflow run instead of staying consumed forever on a cached MODEL.
+    from comfy_execution.utils import get_executing_context
+except Exception:  # older ComfyUI without the execution-context contextvar
+    get_executing_context = None
+
 from .forecaster import SpectrumPredictor
 from .dcw import install_dcw
 from .dcw_calibrator import setup_dcw_calibrator
@@ -144,6 +151,12 @@ class SpectrumState:
         self.captured_feat: Optional[torch.Tensor] = None
         self.patch_consumed = False
 
+        # one_sampler_only: the ComfyUI prompt_id this state was last armed for.
+        # The patched MODEL (and this state) is cached across workflow re-runs,
+        # so we re-arm when the prompt_id changes — otherwise patch_consumed
+        # would stay True forever and Spectrum would no-op on every later queue.
+        self.active_prompt_id = None
+
     def reset(self) -> None:
         """Re-arm a fresh warmup window, discarding the current forecasters.
 
@@ -201,6 +214,40 @@ def _ensure_capture_hook(dit) -> None:
         return
     final_layer.register_forward_pre_hook(_capture_pre_hook)
     final_layer._spectrum_hook_installed = True
+
+
+def _resolve_live_components(apply_model, fallback_dit, fallback_model_sampling, state):
+    """Resolve the DiT + model_sampling that actually run *this* forward.
+
+    The wrapper is invoked as ``model_function_wrapper(model.apply_model, ...)``,
+    so ``apply_model.__self__`` is the live BaseModel. ComfyUI can hand the
+    sampler a *different* DiT instance than the one patched at ``apply_dit_..``
+    time — most commonly a downstream ``AnimaBlockCompile`` clones the model with
+    ``disable_dynamic=True``, which rebuilds ``diffusion_model``. The patch-time
+    refs then point at a dead module: the capture hook never fires, forecasters
+    never fill, and Spectrum silently runs every step actual (looks like the
+    forecaster keeps resetting). Prefer the live module and fall back only if it
+    can't be resolved. Mirrors mod_guidance's re-home.
+    """
+    owner = getattr(apply_model, "__self__", None)
+    dit = getattr(owner, "diffusion_model", None) if owner is not None else None
+    model_sampling = (
+        getattr(owner, "model_sampling", None) if owner is not None else None
+    )
+    if dit is None:
+        dit = fallback_dit
+    elif dit is not fallback_dit and not getattr(state, "_rehomed_logged", False):
+        state._rehomed_logged = True
+        if state.verbose:
+            logger.info(
+                "DiT Spectrum Patch: re-homing to live diffusion_model "
+                "(patch-time id=%x != live id=%x); reinstalling capture hook.",
+                id(fallback_dit) & 0xFFFFFF,
+                id(dit) & 0xFFFFFF,
+            )
+    if model_sampling is None:
+        model_sampling = fallback_model_sampling
+    return dit, model_sampling
 
 
 def _require_dit_spectrum_components(model):
@@ -302,6 +349,31 @@ def _advance_spectrum_state(state: SpectrumState, sigma_val: float) -> bool:
     return True
 
 
+def _maybe_rearm_for_new_execution(state: SpectrumState) -> None:
+    """Re-arm a ``one_sampler_only`` patch at the start of each workflow run.
+
+    ComfyUI caches the patched MODEL output, so the same ``SpectrumState`` is
+    reused across re-queues. Once consumed, ``patch_consumed`` would otherwise
+    stay True for the life of the process and Spectrum would silently no-op on
+    every subsequent run. We key the arming on the current execution's
+    ``prompt_id``: a *different* prompt_id means a fresh workflow run → re-arm;
+    the *same* prompt_id (a later sampler in the same graph, e.g. hi-res fix)
+    keeps the consumed state, preserving the intended one-sampler-only behavior.
+    """
+    if not state.one_sampler_only or get_executing_context is None:
+        return
+    ctx = get_executing_context()
+    prompt_id = getattr(ctx, "prompt_id", None)
+    if prompt_id is None or prompt_id == state.active_prompt_id:
+        return
+    state.active_prompt_id = prompt_id
+    if state.patch_consumed or state.steps_seen > 0:
+        state.reset()
+    state.patch_consumed = False
+    state.steps_seen = 0
+    state.fwd_count = 0
+
+
 def _mark_spectrum_patch_consumed(state: SpectrumState) -> None:
     if not state.one_sampler_only or state.patch_consumed:
         return
@@ -364,8 +436,8 @@ def apply_dit_spectrum_patch(
             return old_wrapper(apply_model, args)
         return apply_model(input_x, timestep, **c)
 
-    def passthrough_forward(apply_model, args, input_x, timestep, c):
-        dit.final_layer._spectrum_state = None
+    def passthrough_forward(apply_model, args, input_x, timestep, c, live_dit):
+        live_dit.final_layer._spectrum_state = None
         return actual_forward(apply_model, args, input_x, timestep, c)
 
     def spectrum_model_patch_wrapper(apply_model, args):
@@ -373,12 +445,27 @@ def apply_dit_spectrum_patch(
         timestep = args["timestep"]
         c = args["c"]
 
-        if state.patch_consumed:
-            return passthrough_forward(apply_model, args, input_x, timestep, c)
+        # Resolve the DiT/model_sampling that actually run this forward — a
+        # downstream compile node may have rebuilt diffusion_model, stranding
+        # the patch-time refs (see _resolve_live_components).
+        live_dit, live_model_sampling = _resolve_live_components(
+            apply_model, dit, model_sampling, state
+        )
 
-        # The hook is a singleton on the shared final_layer. Re-bind on every
-        # call so a reused diffusion_model never writes into a stale patch state.
-        dit.final_layer._spectrum_state = state
+        # Re-arm one_sampler_only when ComfyUI re-runs the workflow (new
+        # prompt_id); the cached MODEL would otherwise stay consumed forever.
+        _maybe_rearm_for_new_execution(state)
+
+        if state.patch_consumed:
+            return passthrough_forward(
+                apply_model, args, input_x, timestep, c, live_dit
+            )
+
+        # Re-home the capture hook + state onto the live final_layer every call,
+        # so a reused *or rebuilt* diffusion_model never writes into a stale
+        # (or dead) patch state.
+        _ensure_capture_hook(live_dit)
+        live_dit.final_layer._spectrum_state = state
 
         cond_or_uncond, valid_chunks = _normalize_cond_or_uncond(
             args, input_x.shape[0]
@@ -386,7 +473,9 @@ def apply_dit_spectrum_patch(
         sigma_val = timestep.flatten()[0].item()
         new_step = _advance_spectrum_state(state, sigma_val)
         if state.patch_consumed:
-            return passthrough_forward(apply_model, args, input_x, timestep, c)
+            return passthrough_forward(
+                apply_model, args, input_x, timestep, c, live_dit
+            )
         if new_step:
             state.mode = (
                 "cached" if valid_chunks and state.should_cache(cond_or_uncond)
@@ -409,9 +498,9 @@ def apply_dit_spectrum_patch(
                 predictions.append(state.forecasters[cou].predict(float(state.step_idx)))
 
             batched_feat = torch.cat(predictions, dim=0)
-            t_internal = model_sampling.timestep(timestep).to(batched_feat.dtype)
-            noise_pred = _spectrum_fast_forward(dit, t_internal, batched_feat)
-            result = model_sampling.calculate_denoised(
+            t_internal = live_model_sampling.timestep(timestep).to(batched_feat.dtype)
+            noise_pred = _spectrum_fast_forward(live_dit, t_internal, batched_feat)
+            result = live_model_sampling.calculate_denoised(
                 timestep, noise_pred.float(), input_x
             )
             _mark_spectrum_patch_consumed(state)

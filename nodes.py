@@ -860,7 +860,9 @@ class DiTSpectrumPatch:
                         "default": False,
                         "tooltip": (
                             "Apply Spectrum only to the first sampler run that "
-                            "uses this patched MODEL; later sampler runs pass through."
+                            "uses this patched MODEL within a workflow run; later "
+                            "sampler runs (e.g. hi-res fix) pass through. Re-arms "
+                            "on each new workflow execution."
                         ),
                     },
                 ),
