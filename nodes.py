@@ -854,6 +854,16 @@ class DiTSpectrumPatch:
                     },
                 ),
                 "enabled": ("BOOLEAN", {"default": True}),
+                "one_sampler_only": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": (
+                            "Apply Spectrum only to the first sampler run that "
+                            "uses this patched MODEL; later sampler runs pass through."
+                        ),
+                    },
+                ),
                 "verbose": (
                     "BOOLEAN",
                     {
@@ -888,6 +898,7 @@ class DiTSpectrumPatch:
         ridge_lambda=0.1,
         history_size=100,
         enabled=True,
+        one_sampler_only=False,
         verbose=False,
     ):
         patched = apply_dit_spectrum_patch(
@@ -902,6 +913,7 @@ class DiTSpectrumPatch:
             ridge_lambda=ridge_lambda,
             history_size=history_size,
             enabled=enabled,
+            one_sampler_only=one_sampler_only,
             verbose=verbose,
         )
         return (patched,)

@@ -49,7 +49,7 @@ CheckpointLoader / model loader → DiT Spectrum Patch → KSampler / KSampler A
 
 Set `steps` on **DiT Spectrum Patch** to the same value as the downstream sampler. The patcher keeps the original Spectrum path: actual steps capture the DiT feature immediately before `final_layer`; cached steps predict that feature and run only `final_layer` + `unpatchify`. It does **not** add modulation guidance, DCW, SMC-CFG, SPEED/SPD, noise generation, latent padding, or a custom sampling loop.
 
-Use `enabled = false` to pass the input model through unchanged. Non-DiT models fail with a clear error rather than silently producing invalid output.
+Use `enabled = false` to pass the input model through unchanged. If the same patched MODEL is connected to multiple sampler nodes, Spectrum applies to every sampler that consumes that MODEL output. Set `one_sampler_only = true` when the patch should apply only to the first sampler run; later sampler runs using the same patched MODEL pass through without Spectrum. Non-DiT models fail with a clear error rather than silently producing invalid output.
 
 ## Parameters
 
@@ -70,6 +70,7 @@ Additional **DiT Spectrum Patch** parameters:
 | `tail_actual_steps` | 3 | Final steps that always run actual DiT forwards |
 | `history_size` | 100 | Forecaster buffer size (same default as the integrated samplers) |
 | `enabled` | true | `false` returns the input MODEL unchanged |
+| `one_sampler_only` | false | Apply Spectrum only to the first sampler run that uses this patched MODEL |
 | `verbose` | false | Logs actual/cached step decisions |
 
 ### Tuning tips
