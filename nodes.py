@@ -136,12 +136,13 @@ def _mod_guidance_advanced_inputs():
         "mod_end_layer": (
             "INT",
             {
-                "default": -1,
+                "default": 27,
                 "min": -1,
                 "max": 999,
                 "tooltip": (
-                    "Exclusive last block + 1. -1 = all remaining blocks. "
-                    "Use 27 (Anima has 28 blocks) to skip the final compensation block."
+                    "Exclusive last block + 1. 27 (default, Anima has 28 blocks) "
+                    "skips the final compensation block — matches the 'step_i8_skip27' "
+                    "preset + the anima_lora CLI. -1 = all remaining blocks."
                 ),
             },
         ),
@@ -640,7 +641,7 @@ class SpectrumKSamplerAdvanced:
         quality_tags,
         mod_w,
         mod_start_layer=8,
-        mod_end_layer=-1,
+        mod_end_layer=27,
         mod_taper=0,
         mod_taper_scale=0.25,
         mod_final_w=0.0,
