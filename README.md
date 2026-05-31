@@ -184,3 +184,17 @@ Unlike the base SPEED node, this node honors **multi-stage** schedules (e.g. `[0
 ### Modulation guidance as a standalone patcher
 
 The **Anima Mod Guidance (model patch)** node applies the same quality steering as the mod-guidance samplers, but as a standalone `MODEL → MODEL` patcher. Wire its output into *any* sampler — including the SPEED node — to compose mod guidance with SPD without a dedicated combined node. (Wire the same `positive` / `negative` conditioning into both the patcher and the sampler; the patcher reads them only to compute the steering delta.) The in-sampler mod-guidance nodes are unchanged.
+
+## CNS — Colored Noise Sampling (sampler entry, not a node)
+
+CNS ([Davidson et al., arXiv:2605.30332](https://arxiv.org/abs/2605.30332)) is a training-free SDE plug-in: it replaces the **white** noise the ER-SDE solver injects each step with **frequency-colored** noise that dumps the step's fixed stochastic-energy budget into the radial frequency bands the network has *not yet resolved* at that σ (per a precomputed completion matrix γ(f, t)). It is a zero-sum spectral *reallocation* of a fixed variance budget — RMS-renormalized, not a noise scale-up — so it sharpens late high-frequency detail without pushing off-manifold.
+
+Unlike the other features here, CNS ships as a **sampler-dropdown entry**, not a node: it lives at the per-step noise-injection seam, which no model patch can reach. Just pick **`er_sde_cns`** in any KSampler's `sampler_name` field.
+
+```
+sampler_name = er_sde_cns        # ER-SDE solver + CNS-recolored per-step noise
+```
+
+- **er_sde only.** CNS only acts on the stochastic path — it *is* the ER-SDE solver with recolored injection. There is no euler/ODE surface (white draw → nothing to recolor). With `er_sde_cns` you get ER-SDE + recoloring in one pick.
+- **Anima-calibrated, auto-downloaded.** The shipped γ matrix (cfg=4, Anima spectral-bias staircase; ~6 KB) auto-downloads to `models/anima_cns/` on first use. On a non-Anima model it is mis-calibrated (still variance-conserving, so degraded-not-broken) — the global dropdown gives no per-model signal, so use it on Anima workflows.
+- **Composes.** Recoloring is the noise term; it stacks cleanly with the Spectrum wrapper and the DCW / SMC-CFG / mod-guidance model patches (all different seams). Full strength, no knobs (a strength < 1 white-blend is strictly inferior per the paper's ablation, so it is not exposed).
