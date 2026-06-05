@@ -808,7 +808,7 @@ def spectrum_sample(
                 m,
                 steps=steps,
                 device=m.load_device,
-                sampler="euler",
+                sampler=sampler_name,
                 scheduler=scheduler,
                 denoise=denoise,
                 model_options=m.model_options,
