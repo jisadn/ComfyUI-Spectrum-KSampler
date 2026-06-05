@@ -24,7 +24,14 @@ import folder_paths
 
 logger = logging.getLogger(__name__)
 
+# Printed once at import (ComfyUI server startup). If you don't see this line in
+# the startup log, the server is running a stale copy — restart it.
+logger.info("[mod-guidance] module loaded: sigma-film v5 (fp32 head, two-step t_emb)")
+
 PROJ_KEYS = ("0.weight", "0.bias", "2.weight", "2.bias")
+# Optional σ-FiLM generator (timestep-conditioned mod head). Present only in
+# adapters trained with `--mod_sigma_film`; absent ⇒ plain σ-flat head.
+FILM_KEYS = ("sigma_film.weight", "sigma_film.bias")
 MOD_APPLY_WRAPPER_KEY = "spectrum_mod_guidance_apply"
 MOD_DIFFUSION_WRAPPER_KEY = "spectrum_mod_guidance"  # legacy key for cleanup
 MOD_STATE_KEY = "spectrum_mod_guidance_state"
@@ -158,10 +165,17 @@ def _load_adapter_cpu(path: str) -> dict:
             f"Adapter missing keys: {', '.join(missing)}. "
             f"Expected pooled_text_proj format with keys: {PROJ_KEYS}"
         )
-    state = {k: raw[k].detach().float().cpu().contiguous() for k in PROJ_KEYS}
+    keys = list(PROJ_KEYS)
+    if all(k in raw for k in FILM_KEYS):
+        keys += list(FILM_KEYS)  # σ-FiLM adapter — carry the generator too
+    state = {k: raw[k].detach().float().cpu().contiguous() for k in keys}
     with _ADAPTER_LOCK:
         _ADAPTER_CPU_CACHE[path] = state
     return state
+
+
+def _adapter_has_film(state) -> bool:
+    return all(k in state for k in FILM_KEYS)
 
 
 def _get_adapter_typed(path: str, device, dtype):
@@ -183,6 +197,58 @@ def _project(pooled, adapter_state):
     x = F.silu(x)
     x = F.linear(x, adapter_state["2.weight"], adapter_state["2.bias"])
     return x
+
+
+def _project_film(pooled, adapter_state, t_emb, out_dtype=None):
+    """σ-conditioned projection. With σ-FiLM weights and a (B, C) normed time
+    embedding ``t_emb``, FiLM-modulate the hidden between the two linears —
+    bit-for-bit the same op as ``_pooled_text_delta`` in
+    ``library/anima/models.py`` (h*(1+scale)+shift). Without either, this is
+    exactly ``_project`` (σ-flat).
+
+    Computes in ``adapter_state``'s dtype — pass an fp32 adapter_state to run the
+    (tiny) head at full precision, matching its fp32-trained weights — then casts
+    the result to ``out_dtype`` (the block compute dtype) so the compiled blocks
+    still receive their native dtype. Each linear's input is cast to its weight
+    dtype anyway, since `t_emb` arrives in the t_embedder's dtype (mul/add below
+    type-promote, so only the matmuls need matching dtypes)."""
+    w0 = adapter_state["0.weight"]
+    x = F.linear(pooled.to(w0.dtype), w0, adapter_state["0.bias"])
+    if t_emb is not None and "sigma_film.weight" in adapter_state:
+        fw = adapter_state["sigma_film.weight"]
+        film = F.linear(t_emb.to(fw.dtype), fw, adapter_state["sigma_film.bias"])
+        scale, shift = film.chunk(2, dim=-1)
+        x = x * (1.0 + scale) + shift
+    x = F.silu(x)
+    w2 = adapter_state["2.weight"]
+    out = F.linear(x.to(w2.dtype), w2, adapter_state["2.bias"])
+    return out if out_dtype is None else out.to(out_dtype)
+
+
+def _compute_t_emb(dit, t):
+    """Reproduce the DiT's normed time embedding (the FiLM conditioning) for the
+    current step's timestep. Returns (B, C). Raises on any shape / attribute
+    mismatch so the caller can fall back to the σ-flat path.
+
+    Two subtleties of MiniTrainDIT, both required:
+    1. Its ``Timesteps`` (sinusoid) returns fp32 and never casts back, so we must
+       step the two t_embedder stages by hand and insert the cast ourselves —
+       calling the whole Sequential clashes fp32 sinusoid × bf16 linear.
+    2. The cast target is the t_embedder's WEIGHT dtype, NOT the incoming latent
+       dtype: in the APPLY_MODEL wrapper ``args[0]`` is still the sampler's fp32
+       latent (the model casts it internally later), so x.dtype is wrong here."""
+    te = dit.t_embedder
+    p = next(te[1].parameters(), None)
+    wdt = p.dtype if p is not None else t.dtype
+    t_bt = t.reshape(-1, 1) if t.ndim == 1 else t
+    sin = te[0](t_bt)             # Timesteps -> fp32
+    emb = te[1](sin.to(wdt))      # cast to embedder weight dtype, then its linears
+    if isinstance(emb, (tuple, list)):
+        emb = emb[0]
+    emb = dit.t_embedding_norm(emb)
+    if emb.ndim == 3:
+        emb = emb[:, 0, :]
+    return emb
 
 
 class _PerBlockState:
@@ -251,6 +317,14 @@ class ModGuidanceState:
         self.uncond_combined: Optional[torch.Tensor] = None    # (1, C) base proj_neg
         self.delta_unit: Optional[torch.Tensor] = None         # (1, C) proj_tag - proj_neg
         self.per_block_schedule: Optional[List[float]] = None  # length num_blocks
+        # σ-FiLM: when the adapter carries a FiLM generator, the projections are
+        # timestep-dependent and cannot be precomputed once — the wrapper
+        # recomputes them per step from these cached pooled vectors + state.
+        self.has_film: bool = False
+        self.adapter_state: Optional[dict] = None              # typed, on device
+        self.tag_pooled: Optional[torch.Tensor] = None         # (1, pooled_dim)
+        self.neg_pooled: Optional[torch.Tensor] = None
+        self.pos_pooled: Optional[torch.Tensor] = None
 
     def _encode_pool(self, raw, t5_ids, t5_weights, device, dtype):
         # The DiT's llm_adapter can live on a different device than the sampling
@@ -296,12 +370,29 @@ class ModGuidanceState:
             self.cond_combined = proj_pos.detach()       # (1, C)
             self.uncond_combined = proj_neg.detach()     # (1, C)
             # Unit steering direction — scaled per-block by `self.per_block_schedule`.
+            # σ-flat fallback value; the wrapper overrides it per step when FiLM.
             self.delta_unit = (proj_tag - proj_neg).detach()
+            # Cache pooled + typed state so the wrapper can recompute σ-conditioned
+            # projections each step when the adapter is a σ-FiLM head.
+            self.has_film = _adapter_has_film(adapter_state)
+            if self.has_film:
+                # Run the (tiny ~8M-param) FiLM head in fp32 to match its
+                # fp32-trained weights; cache the fp32-typed copy ONCE so the
+                # per-step recompute does no weight casting. Output is cast back
+                # to the block dtype in the wrapper. (_get_adapter_typed caches
+                # per (path, device, dtype), so this is a one-time upcast.)
+                self.adapter_state = _get_adapter_typed(
+                    self.adapter_path, device, torch.float32
+                )
+                self.tag_pooled = tag_pooled.detach()
+                self.neg_pooled = neg_pooled.detach()
+                self.pos_pooled = pos_pooled.detach()
         self._build_schedule()
         logger.info(
             f"Mod guidance: precomputed "
             f"(w={self.w}, start={self.start_layer}, end={self.end_layer}, "
-            f"taper={self.taper}, taper_scale={self.taper_scale}, final_w={self.final_w})"
+            f"taper={self.taper}, taper_scale={self.taper_scale}, "
+            f"final_w={self.final_w}, sigma_film={self.has_film})"
         )
 
     def _build_schedule(self):
@@ -461,20 +552,65 @@ def _mod_apply_wrapper(executor, *args, **kwargs):
     mod_state.ensure_precomputed(device, dtype)
 
     cond_or_uncond = transformer_options.get("cond_or_uncond", [0])
-    cond_c = mod_state.cond_combined.to(device=device, dtype=dtype)
-    uncond_c = mod_state.uncond_combined.to(device=device, dtype=dtype)
-    pieces = [cond_c if cou == 0 else uncond_c for cou in cond_or_uncond]
-    combined = torch.cat(pieces, dim=0)  # (B, C)
+
+    # σ-FiLM heads are timestep-dependent: recompute the base projections and
+    # the steering delta for THIS step's σ. All of this runs in the wrapper
+    # (outside torch.compile), so the compiled t_emb / block hooks still only
+    # read a finished tensor — the hot path is byte-identical to the σ-flat case.
+    combined = None
+    delta_unit_typed = None
+    if mod_state.has_film and mod_state.adapter_state is not None:
+        try:
+            t_emb = _compute_t_emb(dit, args[1].to(device))  # (Bt, C)
+            state = mod_state.adapter_state  # fp32 (see ensure_precomputed)
+            pos_p = mod_state.pos_pooled.to(device)
+            neg_p = mod_state.neg_pooled.to(device)
+            tag_p = mod_state.tag_pooled.to(device)
+            pieces = []
+            for i, cou in enumerate(cond_or_uncond):
+                ti = t_emb[i : i + 1] if t_emb.shape[0] > i else t_emb[:1]
+                pooled_i = pos_p if cou == 0 else neg_p
+                # fp32 compute, cast to block dtype on the way out.
+                pieces.append(_project_film(pooled_i, state, ti, dtype))
+            combined = torch.cat(pieces, dim=0)  # (B, C)
+            # Steering delta at this σ (cond row; CFG cond/uncond share σ).
+            t0 = t_emb[:1]
+            delta_unit_typed = _project_film(tag_p, state, t0, dtype) - _project_film(
+                neg_p, state, t0, dtype
+            )
+        except Exception as e:  # graceful: degrade to σ-flat, warn once
+            combined = None
+            if not getattr(dit, "_anima_film_fallback_warned", False):
+                try:
+                    tedt = next(dit.t_embedder.parameters()).dtype
+                except Exception:
+                    tedt = "?"
+                adt = (
+                    mod_state.adapter_state["0.weight"].dtype
+                    if mod_state.adapter_state is not None
+                    else "?"
+                )
+                logger.warning(
+                    "[mod-guidance] σ-FiLM recompute fell back to σ-flat (v5 fp32-head): "
+                    "%s [t=%s, t_embedder=%s, adapter=%s]. If you just edited the node, "
+                    "RESTART the ComfyUI server — re-queuing does NOT reload Python modules.",
+                    e, args[1].dtype, tedt, adt,
+                )
+                dit._anima_film_fallback_warned = True
+
+    if combined is None:
+        # σ-flat path: plain adapters, and the FiLM fallback above.
+        cond_c = mod_state.cond_combined.to(device=device, dtype=dtype)
+        uncond_c = mod_state.uncond_combined.to(device=device, dtype=dtype)
+        pieces = [cond_c if cou == 0 else uncond_c for cou in cond_or_uncond]
+        combined = torch.cat(pieces, dim=0)  # (B, C)
+        delta_unit_typed = mod_state.delta_unit.to(device=device, dtype=dtype)
 
     # Expose for Spectrum fast-forward (eager, cached steps) and for the
     # t_emb hook (compiled path). Both writes are outside torch.compile.
     dit._mod_pooled_proj = combined.detach()
     t_norm = dit.t_embedding_norm
     t_norm._anima_mod_delta = combined.unsqueeze(1)
-
-    # Per-block / final-layer hooks read this. delta_unit cast to runtime dtype
-    # once here; hooks lazy-recast if needed.
-    delta_unit_typed = mod_state.delta_unit.to(device=device, dtype=dtype)
     dit._anima_mod_block_state = _PerBlockState(
         delta_unit=delta_unit_typed,
         schedule=mod_state.per_block_schedule,
