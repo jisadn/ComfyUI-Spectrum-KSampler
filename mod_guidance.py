@@ -40,7 +40,7 @@ AUTO_ADAPTER_SENTINEL = "(auto-download default)"
 DEFAULT_ADAPTER_FILENAME = "pooled_text_proj-0611.safetensors"
 DEFAULT_ADAPTER_URL = (
     "https://github.com/sorryhyun/ComfyUI-Spectrum-KSampler/releases/download/"
-    "0611/pooled_text_proj-0611.safetensors"
+    "0605/pooled_text_proj-0611.safetensors"
 )
 DEFAULT_ADAPTER_SUBDIR = "anima_mod_guidance"
 
