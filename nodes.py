@@ -597,6 +597,122 @@ class SpectrumKSamplerModGuidance:
         )
 
 
+# refresh_ratio: the SEA speed dial. 0.0 = auto = match the growing-window
+# schedule's own refresh fraction at this step count (compute-matched — same
+# speed as the plain Spectrum mod-guidance node, just smarter about which steps
+# it spends compute on). A positive value below that fraction trades quality for
+# speed. Each distinct value calibrates + caches its own δ on first use.
+_SEA_REFRESH_RATIO_INPUT = (
+    "FLOAT",
+    {
+        "default": 0.0,
+        "min": 0.0,
+        "max": 1.0,
+        "step": 0.01,
+        "tooltip": (
+            "SEA refresh ratio — fraction of mid-trajectory steps that run a real "
+            "forward. 0 = auto (match the growing-window schedule at this step "
+            "count; same speed as the non-SEA node). Lower = faster, less faithful. "
+            "First run at each (resolution / steps / cfg / refresh_ratio) does a "
+            "one-time full-compute calibration pass, then caches δ to the ComfyUI "
+            "user dir; later runs at that config get the fast SEA trigger."
+        ),
+    },
+)
+
+
+class SpectrumSEAKSamplerModGuidance:
+    """Spectrum SEA sampler with modulation guidance.
+
+    Same forecasting + mod-guidance as the Spectrum mod-guidance node, but the
+    *when-to-skip* decision uses the Spectral-Evolution-Aware (SEA) metric
+    (SeaCache) instead of the content-blind growing window: it refreshes when the
+    accumulated SEA-filtered latent distance crosses an auto-calibrated δ, so
+    compute lands on the steps that actually move content. δ generalizes across
+    mod-guidance (validated), so calibration runs with mod active and stays valid.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                **_KSAMPLER_INPUTS,
+                **_MOD_GUIDANCE_SIMPLE_INPUTS,
+                "refresh_ratio": _SEA_REFRESH_RATIO_INPUT,
+                "adaptive_smc_alpha": _SMC_CFG_ALPHA_INPUT,
+            }
+        }
+
+    RETURN_TYPES = ("LATENT",)
+    FUNCTION = "sample"
+    CATEGORY = "sampling"
+    DESCRIPTION = (
+        "Spectrum-accelerated sampler with SEA cache scheduling + modulation "
+        "guidance. The SEA decision metric (SeaCache) refreshes on content "
+        "evolution rather than a fixed window, with δ auto-calibrated to the "
+        "refresh_ratio on first use and cached per config. Mod guidance steers "
+        "toward quality tags via the learned pooled-text projection (auto-"
+        "downloaded). Optional α-adaptive SMC-CFG for detail recovery. "
+        "Set mod_w_profile='off' to skip mod guidance."
+    )
+
+    def sample(
+        self,
+        model,
+        clip,
+        seed,
+        steps,
+        cfg,
+        sampler_name,
+        scheduler,
+        positive,
+        negative,
+        latent_image,
+        quality_tags,
+        mod_w_profile,
+        refresh_ratio,
+        denoise=1.0,
+        adaptive_smc_alpha=_SMC_CFG_ALPHA_DEFAULT,
+    ):
+        if mod_w_profile == MOD_W_PROFILE_OFF:
+            m = model
+        else:
+            profile = MOD_W_PROFILES.get(mod_w_profile) or MOD_W_PROFILES[DEFAULT_MOD_W_PROFILE]
+            m = model.clone()
+            setup_mod_guidance(
+                m,
+                clip,
+                positive,
+                negative,
+                None,
+                quality_tags,
+                profile["w"],
+                start_layer=profile["start_layer"],
+                end_layer=profile["end_layer"],
+                taper=profile["taper"],
+                taper_scale=profile["taper_scale"],
+                final_w=profile["final_w"],
+            )
+        return spectrum_sample(
+            m,
+            seed,
+            steps,
+            cfg,
+            sampler_name,
+            scheduler,
+            positive,
+            negative,
+            latent_image,
+            denoise,
+            **_SPECTRUM_DEFAULTS,
+            dcw_mode="off",
+            smc_cfg_alpha=adaptive_smc_alpha,
+            smc_cfg_lambda=_SMC_CFG_LAMBDA_DEFAULT,
+            schedule="sea",
+            refresh_ratio=refresh_ratio,
+        )
+
+
 class SpectrumKSamplerAdvanced:
     """Full Spectrum sampler with modulation guidance and tunable forecasting parameters."""
 
@@ -1120,6 +1236,7 @@ class SpectrumSPDLoRAKSampler:
 NODE_CLASS_MAPPINGS = {
     "SpectrumKSampler": SpectrumKSampler,
     "SpectrumKSamplerModGuidance": SpectrumKSamplerModGuidance,
+    "SpectrumSEAKSamplerModGuidance": SpectrumSEAKSamplerModGuidance,
     "SpectrumKSamplerAdvanced": SpectrumKSamplerAdvanced,
     "SpectrumSPDKSampler": SpectrumSPDKSampler,
     "SpectrumSPDLoRAKSampler": SpectrumSPDLoRAKSampler,
@@ -1130,6 +1247,7 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "SpectrumKSampler": "KSampler (Spectrum)",
     "SpectrumKSamplerModGuidance": "KSampler (Spectrum + Mod Guidance)",
+    "SpectrumSEAKSamplerModGuidance": "KSampler (Spectrum SEA + Mod Guidance)",
     "SpectrumKSamplerAdvanced": "KSampler (Spectrum + Mod Guidance Advanced)",
     "SpectrumSPDKSampler": "KSampler (Spectrum + SPD / SPEED)",
     "SpectrumSPDLoRAKSampler": "KSampler (SPD LoRA / auto-schedule)",

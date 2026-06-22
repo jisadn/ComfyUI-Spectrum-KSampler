@@ -3,7 +3,7 @@
 import copy
 import logging
 import math
-from typing import Optional, Dict, Sequence
+from typing import List, Optional, Dict, Sequence
 
 import torch
 import torch.nn.functional as F
@@ -21,6 +21,7 @@ except Exception:  # older ComfyUI without the execution-context contextvar
     get_executing_context = None
 
 from .forecaster import SpectrumPredictor
+from .spectrum_sea import l1rel, sea_filter
 from .dcw import install_dcw
 from .dcw_calibrator import setup_dcw_calibrator
 from .smc_cfg import install_smc_cfg
@@ -119,6 +120,10 @@ class SpectrumState:
         history_size: int = 100,
         verbose: bool = False,
         one_sampler_only: bool = False,
+        schedule: str = "window",
+        refresh_ratio: float = -1.0,
+        sea_beta: float = 2.0,
+        delta: Optional[float] = None,
     ):
         self.window_size = window_size
         self.flex_window = flex_window
@@ -131,6 +136,18 @@ class SpectrumState:
         self.history_size = history_size
         self.verbose = verbose
         self.one_sampler_only = one_sampler_only
+
+        # SEA schedule (SeaCache decision metric). schedule="sea" replaces the
+        # growing-window rule with accumulate-until-δ on the SEA-filtered latent.
+        # delta is None while uncalibrated → the loop falls back to the window
+        # rule and records the per-step distance trace for one-shot auto-δ.
+        self.schedule = schedule
+        self.refresh_ratio = refresh_ratio
+        self.sea_beta = sea_beta
+        self.delta = delta
+        self.sea_accum = 0.0
+        self.sea_prev: Optional[torch.Tensor] = None
+        self.sea_dists: List[float] = []  # decision-region trace, calibration only
 
         # Runtime
         self.step_idx = -1
@@ -173,6 +190,31 @@ class SpectrumState:
         self.consec_cached = 0
         self.forecasters = {}
         self.captured_feat = None
+        self.sea_accum = 0.0
+        self.sea_prev = None
+        self.sea_dists = []
+
+    def observe_sea(self, latent: torch.Tensor, sigma: float) -> None:
+        """Accrue the SEA-filtered latent distance for the current step.
+
+        Called once per new sampler step (after step_idx advanced, before the
+        cache decision) on the input latent x_t. Under CFG the batch tiles the
+        same x_t across cond/uncond, so row 0 is x_t. Mirrors the training-repo
+        loop: distance accrues into ``sea_accum`` (reset on each refresh, Eq. 8)
+        and, during the uncalibrated pass only, the raw per-step distance is
+        recorded over the decision region for one-shot auto-δ.
+        """
+        if self.schedule != "sea":
+            return
+        x = latent[0:1]  # (1, C, H, W) — x_t
+        sea_now = sea_filter(x, float(sigma), self.sea_beta)
+        if self.sea_prev is not None:
+            d = l1rel(sea_now, self.sea_prev)
+            self.sea_accum += d
+            stop_at = self.num_steps - self.tail_actual_steps
+            if self.delta is None and self.warmup_steps <= self.step_idx < stop_at:
+                self.sea_dists.append(d)
+        self.sea_prev = sea_now
 
     def _forecaster_ready(self, cou: int) -> bool:
         forecaster = self.forecasters.get(cou)
@@ -193,6 +235,12 @@ class SpectrumState:
             return False
         if cond_or_uncond is not None and not self.forecasters_ready(cond_or_uncond):
             return False
+        if self.schedule == "sea" and self.delta is not None:
+            # Refresh (actual) once the accumulated SEA distance crosses δ; cache
+            # (skip) until then. The accumulator resets on each refresh in the
+            # step-advance bookkeeping (alongside consec_cached).
+            return self.sea_accum < self.delta
+        # Window schedule, or SEA calibration pass (δ uncalibrated) → window rule.
         return (self.consec_cached + 1) % max(1, math.floor(self.curr_ws)) != 0
 
     def has_forecasters(self, cond_or_uncond: list) -> bool:
@@ -603,6 +651,9 @@ def spectrum_sample(
     spd_sigma: float = 1.0,
     spd_stages=None,
     spd_transition_sigmas=None,
+    schedule: str = "window",
+    refresh_ratio: float = -1.0,
+    sea_beta: float = 2.0,
 ):
     """Shared Spectrum sampling logic used by all node tiers.
 
@@ -677,6 +728,44 @@ def spectrum_sample(
             calibrator=calibrator,
         )
 
+    # SEA schedule: resolve the auto-δ target + load any cached δ for this config.
+    # An uncached config runs one window-scheduled calibration pass (full compute)
+    # then persists δ; later generates at the same config use the SEA trigger.
+    # Mirror SpectrumState's tail default; threaded to both the cache key's
+    # stop_at and the state so the decision region can never drift between them.
+    tail_actual_steps = 3
+    sea_key = None
+    sea_delta = None
+    if schedule == "sea" and (spd_stages or spd_scale < 1.0):
+        logger.warning(
+            "Spectrum SEA is incompatible with SPD/SPEED (mid-loop σ re-spacing "
+            "breaks the distance trace); falling back to the window schedule."
+        )
+        schedule = "window"
+    if schedule == "sea":
+        from . import spectrum_sea as _sea
+
+        stop_at = steps - tail_actual_steps
+        if refresh_ratio <= 0.0:
+            refresh_ratio = _sea.window_decision_fraction(
+                steps, warmup_steps, stop_at, window_size, flex_window
+            )
+        h_lat, w_lat = (
+            int(latent_image["samples"].shape[-2]),
+            int(latent_image["samples"].shape[-1]),
+        )
+        sea_key = _sea.make_cache_key(
+            steps, warmup_steps, stop_at, refresh_ratio, cfg, sampler_name, h_lat, w_lat
+        )
+        sea_delta = _sea.load_delta(sea_key)
+        logger.info(
+            "Spectrum SEA: refresh_ratio=%.3f, δ=%s (%s)",
+            refresh_ratio,
+            f"{sea_delta:.4g}" if sea_delta is not None else "uncalibrated",
+            "cached → SEA trigger" if sea_delta is not None
+            else "calibrating this run (window schedule, full compute)",
+        )
+
     state = SpectrumState(
         window_size=window_size,
         flex_window=flex_window,
@@ -685,6 +774,11 @@ def spectrum_sample(
         m=cheby_degree,
         lam=ridge_lambda,
         num_steps=steps,
+        tail_actual_steps=tail_actual_steps,
+        schedule=schedule,
+        refresh_ratio=refresh_ratio,
+        sea_beta=sea_beta,
+        delta=sea_delta,
     )
 
     dit = m.model.diffusion_model
@@ -714,12 +808,15 @@ def spectrum_sample(
                     if state.step_idx >= state.warmup_steps:
                         state.curr_ws = round(state.curr_ws + state.flex_window, 3)
                     state.consec_cached = 0
+                    state.sea_accum = 0.0  # refresh resets the SEA accumulator (Eq. 8)
                 else:
                     state.consec_cached += 1
 
             state.step_idx += 1
             state.steps_seen += 1
             state.last_sigma = sigma_val
+            # Accrue the SEA distance on this step's x_t before the cache decision.
+            state.observe_sea(input_x, sigma_val)
             state.mode = "cached" if state.should_cache() else "actual"
 
         if state.mode == "cached" and state.has_forecasters(cond_or_uncond):
@@ -873,6 +970,23 @@ def spectrum_sample(
         f"{tag}: {actual}/{total} actual forwards "
         f"({speedup:.2f}x block-skip ratio{cfg_note})"
     )
+
+    # SEA auto-δ: this generate ran the window schedule while recording the SEA
+    # distance trace — solve the δ that hits the target refresh fraction and cache
+    # it so subsequent generates at this config use the SEA trigger.
+    if schedule == "sea" and sea_delta is None and sea_key is not None and state.sea_dists:
+        from . import spectrum_sea as _sea
+
+        new_delta = _sea.solve_delta_for_refresh_ratio(state.sea_dists, refresh_ratio)
+        _sea.save_delta(sea_key, new_delta)
+        logger.info(
+            "Spectrum SEA: auto-calibrated δ=%.4g (target refresh_ratio=%.3f over "
+            "%d decision steps); cached → subsequent generates at this config use "
+            "the SEA trigger.",
+            new_delta,
+            refresh_ratio,
+            len(state.sea_dists),
+        )
 
     out = latent_image.copy()
     out.pop("downscale_ratio_spacial", None)
