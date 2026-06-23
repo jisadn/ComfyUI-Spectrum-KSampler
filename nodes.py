@@ -482,6 +482,121 @@ _DCW_INPUTS = {
 }
 
 
+# Foresight Guidance (FSG) + CFG++ substrate (paper arXiv 23177). FSG reframes
+# CFG as a fixed-point calibration; faithful FSG is defined on a CFG++ substrate.
+# The validated production point (1024 tier / 28-step er_sde) is the defaults
+# below. Both need CFG != 1; neither composes with SPD/SPEED.
+_FSG_INPUTS = {
+    "cfgpp_lambda": (
+        "FLOAT",
+        {
+            "default": 0.0,
+            "min": 0.0,
+            "max": 8.0,
+            "step": 0.1,
+            "round": 0.001,
+            "tooltip": (
+                "CFG++ substrate strength λ (0 = off, plain CFG). Replaces the "
+                "constant-w cond/uncond combine with the σ-scheduled CFG++ weight "
+                "(paper App A.2) — the substrate faithful FSG is defined on. "
+                "λ=1.5 is the production point (tracks CFG=4 saturation/contrast/"
+                "composition; <1.5 under-guides, >=2 over-saturates). This is a "
+                "FLOW-space coefficient, not the paper's DDIM λ. Mutually exclusive "
+                "with SMC-CFG (SMC wins if both on)."
+            ),
+        },
+    ),
+    "fsg": (
+        "BOOLEAN",
+        {
+            "default": False,
+            "tooltip": (
+                "Foresight Guidance: pre-step latent calibration toward the golden "
+                "path. Runs K forward-backward fixed-point iterations on the latent "
+                "before each in-band step (each forced to an actual Spectrum "
+                "forward; ~3·K extra forwards per in-band step). Needs CFG != 1. "
+                "Pair with cfgpp_lambda=1.5 for the validated fsg/cfg++ point."
+            ),
+        },
+    ),
+    "fsg_band_lo": (
+        "FLOAT",
+        {
+            "default": 0.59,
+            "min": 0.0,
+            "max": 1.0,
+            "step": 0.01,
+            "tooltip": (
+                "FSG σ-band lower bound. The band is where calibration fires. "
+                "Default [0.59, 0.75] is the 1024-token-tier / 28-step er_sde "
+                "point. The contracting band moves DOWN for more steps and for "
+                "low-token (~768px) renders, UP for fewer steps. σ≈0.94 always "
+                "DIVERGES (the paper's noisy-stage prescription is wrong on Anima) "
+                "— do not raise hi past ~0.85. Re-tune if you change steps/res."
+            ),
+        },
+    ),
+    "fsg_band_hi": (
+        "FLOAT",
+        {
+            "default": 0.75,
+            "min": 0.0,
+            "max": 1.0,
+            "step": 0.01,
+            "tooltip": (
+                "FSG σ-band upper bound. See fsg_band_lo. Default 0.75 is the "
+                "28-step er_sde sweet spot (it was 0.85 at 20-step Euler — the "
+                "band slid down on the denser grid)."
+            ),
+        },
+    ),
+    "fsg_k": (
+        "INT",
+        {
+            "default": 3,
+            "min": 0,
+            "max": 8,
+            "tooltip": (
+                "FSG fixed-point iterations per in-band step (0 = inert). Error "
+                "~ρ^K with ρ≈0.93, so K=3 captures ~all the gain; K=2 drift-"
+                "saturates, K=3 adds visible detail. Each iteration is ~3 extra "
+                "DiT forwards."
+            ),
+        },
+    ),
+    "fsg_d_sigma": (
+        "FLOAT",
+        {
+            "default": 0.1,
+            "min": 0.01,
+            "max": 0.3,
+            "step": 0.01,
+            "round": 0.001,
+            "tooltip": (
+                "FSG forward-backward stride Δσ. Stability is governed by γ·Δσ; "
+                "0.1 contracts at γ≈4. Larger Δσ is what makes the operator "
+                "diverge — leave at 0.1 unless you also shrink γ."
+            ),
+        },
+    ),
+    "fsg_gamma": (
+        "FLOAT",
+        {
+            "default": 0.0,
+            "min": 0.0,
+            "max": 16.0,
+            "step": 0.5,
+            "tooltip": (
+                "FSG calibration guidance γ (0 = use the CFG scale). Keep ≈ the "
+                "CFG scale (=4) even on the CFG++ substrate — matching γ to the "
+                "CFG++ effective weight (~11 in-band) makes the operator DIVERGE "
+                "(stability is set by γ·Δσ)."
+            ),
+        },
+    ),
+}
+
+
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
@@ -658,6 +773,23 @@ class SpectrumKSampler:
                 **_MOD_PROFILE_INPUTS,
                 "refresh_ratio": _REFRESH_RATIO_INPUT,
                 "adaptive_smc_alpha": _SMC_CFG_ALPHA_INPUT,
+                "fsg": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": (
+                            "Foresight Guidance toward the golden path (one "
+                            "switch = the validated production stack: CFG++ λ=1.5 "
+                            "substrate + FSG band [0.59,0.75], K=3, on the 1024 "
+                            "tier @ ~28 steps). Needs CFG != 1. Because CFG++ "
+                            "replaces the cond/uncond combine, turning this ON "
+                            "disables SMC-CFG (they are mutually exclusive). "
+                            "Adds ~3·K forwards per in-band step. Band/K/Δσ/γ and "
+                            "the CFG++ λ are tunable on the Advanced node; re-tune "
+                            "if you change steps/resolution (the band moves)."
+                        ),
+                    },
+                ),
             },
             "optional": {
                 **_CLIP_INPUT,
@@ -693,6 +825,7 @@ class SpectrumKSampler:
         quality_tags,
         mod_w_profile,
         refresh_ratio,
+        fsg=False,
         quality_neg="",
         clip=None,
         denoise=1.0,
@@ -708,6 +841,14 @@ class SpectrumKSampler:
             quality_neg=quality_neg,
         )
         schedule, refresh_ratio = _schedule_for(refresh_ratio)
+        # The simple toggle enables the whole validated stack: CFG++ λ=1.5 +
+        # FSG at the production band/K (spectrum_sample's defaults). CFG++
+        # replaces the cond/uncond combine, so SMC-CFG must be off when FSG is on
+        # (they both own sampler_cfg_function). Detail knobs live on Advanced.
+        fsg_extra = (
+            {"cfgpp_lambda": 1.5, "fsg_enabled": True} if fsg else {}
+        )
+        smc_alpha = 0.0 if fsg else adaptive_smc_alpha
         return _run_spectrum(
             m,
             seed,
@@ -719,9 +860,10 @@ class SpectrumKSampler:
             negative,
             latent_image,
             denoise,
-            smc_alpha=adaptive_smc_alpha,
+            smc_alpha=smc_alpha,
             schedule=schedule,
             refresh_ratio=refresh_ratio,
+            **fsg_extra,
         )
 
 
@@ -736,6 +878,7 @@ class SpectrumKSamplerAdvanced:
                 **_mod_guidance_advanced_inputs(),
                 **_SPECTRUM_INPUTS,
                 **_DCW_INPUTS,
+                **_FSG_INPUTS,
                 "adaptive_smc_alpha": _SMC_CFG_ALPHA_INPUT,
                 "smc_cfg_lambda": _SMC_CFG_LAMBDA_INPUT,
             }
@@ -785,6 +928,13 @@ class SpectrumKSamplerAdvanced:
         dcw_lambda=0.01,
         dcw_band_mask="LL",
         dcw_calibrator=AUTO_CALIBRATOR_SENTINEL,
+        cfgpp_lambda=0.0,
+        fsg=False,
+        fsg_band_lo=0.59,
+        fsg_band_hi=0.75,
+        fsg_k=3,
+        fsg_d_sigma=0.1,
+        fsg_gamma=0.0,
         adaptive_smc_alpha=_SMC_CFG_ALPHA_DEFAULT,
         smc_cfg_lambda=_SMC_CFG_LAMBDA_DEFAULT,
     ):
@@ -827,6 +977,12 @@ class SpectrumKSamplerAdvanced:
             clip=clip,
             smc_cfg_alpha=adaptive_smc_alpha,
             smc_cfg_lambda=smc_cfg_lambda,
+            cfgpp_lambda=cfgpp_lambda,
+            fsg_enabled=fsg,
+            fsg_band=(fsg_band_lo, fsg_band_hi),
+            fsg_k=fsg_k,
+            fsg_d_sigma=fsg_d_sigma,
+            fsg_gamma=fsg_gamma,
         )
 
 

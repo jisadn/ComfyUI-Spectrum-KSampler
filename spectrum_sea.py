@@ -172,22 +172,28 @@ def make_cache_key(
     sampler: str,
     h: int,
     w: int,
+    extra: str = "",
 ) -> str:
     """Stable string key. Mirrors the training repo's tuple (prompt deliberately
-    excluded — fixed δ + per-prompt-varying refresh pattern is the design)."""
-    return "|".join(
-        str(x)
-        for x in (
-            int(num_steps),
-            int(warmup_steps),
-            int(stop_at),
-            round(float(refresh_ratio), 4),
-            round(float(cfg), 3),
-            str(sampler),
-            int(h),
-            int(w),
-        )
-    )
+    excluded — fixed δ + per-prompt-varying refresh pattern is the design).
+
+    ``extra`` carries any non-default substrate that changes the trajectory the
+    δ is calibrated against (CFG++ λ, FSG band/K) so its δ never aliases a plain
+    run's. Empty (the common case) reproduces the original 8-field key exactly.
+    """
+    fields = [
+        int(num_steps),
+        int(warmup_steps),
+        int(stop_at),
+        round(float(refresh_ratio), 4),
+        round(float(cfg), 3),
+        str(sampler),
+        int(h),
+        int(w),
+    ]
+    if extra:
+        fields.append(str(extra))
+    return "|".join(str(x) for x in fields)
 
 
 def load_delta(key: str) -> Optional[float]:

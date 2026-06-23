@@ -25,6 +25,7 @@ from .spectrum_sea import l1rel, sea_filter
 from .dcw import install_dcw
 from .dcw_calibrator import setup_dcw_calibrator
 from .smc_cfg import install_smc_cfg
+from .fsg import FSGCalibrator, fsg_step_indices, install_cfgpp, install_fsg
 
 logger = logging.getLogger(__name__)
 
@@ -124,6 +125,7 @@ class SpectrumState:
         refresh_ratio: float = -1.0,
         sea_beta: float = 2.0,
         delta: Optional[float] = None,
+        fsg_steps: Optional[frozenset] = None,
     ):
         self.window_size = window_size
         self.flex_window = flex_window
@@ -148,6 +150,12 @@ class SpectrumState:
         self.sea_accum = 0.0
         self.sea_prev: Optional[torch.Tensor] = None
         self.sea_dists: List[float] = []  # decision-region trace, calibration only
+
+        # FSG: step indices forced to actual forwards (the latent is calibrated
+        # before these steps, so a cached feature forecast would be stale) and
+        # excluded from the SEA decision denominator — same treatment as
+        # warmup/tail. Empty when FSG is off.
+        self.fsg_steps: frozenset = fsg_steps or frozenset()
 
         # Runtime
         self.step_idx = -1
@@ -212,7 +220,11 @@ class SpectrumState:
             d = l1rel(sea_now, self.sea_prev)
             self.sea_accum += d
             stop_at = self.num_steps - self.tail_actual_steps
-            if self.delta is None and self.warmup_steps <= self.step_idx < stop_at:
+            if (
+                self.delta is None
+                and self.warmup_steps <= self.step_idx < stop_at
+                and self.step_idx not in self.fsg_steps
+            ):
                 self.sea_dists.append(d)
         self.sea_prev = sea_now
 
@@ -233,6 +245,8 @@ class SpectrumState:
         stop_at = self.num_steps - self.tail_actual_steps
         if self.step_idx >= stop_at:
             return False
+        if self.step_idx in self.fsg_steps:
+            return False  # FSG-calibrated step — must run an actual forward
         if cond_or_uncond is not None and not self.forecasters_ready(cond_or_uncond):
             return False
         if self.schedule == "sea" and self.delta is not None:
@@ -654,6 +668,12 @@ def spectrum_sample(
     schedule: str = "window",
     refresh_ratio: float = -1.0,
     sea_beta: float = 2.0,
+    cfgpp_lambda: float = 0.0,
+    fsg_enabled: bool = False,
+    fsg_band=(0.59, 0.75),
+    fsg_k: int = 3,
+    fsg_d_sigma: float = 0.1,
+    fsg_gamma: float = 0.0,
 ):
     """Shared Spectrum sampling logic used by all node tiers.
 
@@ -691,6 +711,22 @@ def spectrum_sample(
         injecting visible chattering. Velocity-space combine (preserves
         across-step correctness when σ varies). Requires CFG ≠ 1 (auto-skipped).
     smc_cfg_lambda: SMC sliding-manifold slope λ. Paper sweep {3,4,5,6}; 5 best.
+
+    cfgpp_lambda: CFG++ substrate strength λ (0 = off). Replaces the constant-w
+        cond/uncond combine with the σ-scheduled CFG++ weight (paper App A.2);
+        the substrate faithful FSG is defined on. λ=1.5 is the production point
+        (tracks CFG=4 saturation/contrast). Mutually exclusive with SMC-CFG.
+    fsg_enabled: Foresight Guidance pre-step latent calibration toward the
+        golden path. Runs K forward-backward fixed-point iterations on the latent
+        before each in-band step (forced to actual Spectrum forwards). Needs
+        CFG ≠ 1. Pairs with cfgpp_lambda=1.5 for the production fsg/cfg++ point.
+    fsg_band / fsg_k / fsg_d_sigma / fsg_gamma: FSG knobs. Band (σ_lo, σ_hi) is
+        where calibration fires — default [0.59, 0.75] is the 1024-tier/28-step
+        er_sde point; it moves DOWN for more steps and low-token (~768px) renders,
+        UP for fewer steps (re-tune if you change steps/resolution; σ≈0.94 always
+        diverges). K=3 iterations (each ~3 extra forwards). Δσ=0.1 stride.
+        fsg_gamma=0 → use the CFG scale (=guidance); keep ≈4 even under CFG++
+        (matching it to the CFG++ effective weight diverges).
     """
     m = model.clone()
 
@@ -728,6 +764,62 @@ def spectrum_sample(
             calibrator=calibrator,
         )
 
+    # CFG++ substrate + FSG foresight calibration. Both need CFG (a cond/uncond
+    # gap) and the σ schedule (CFG++ maps σ_i → σ_next for its reweight; FSG
+    # forces its in-band steps to actual forwards). CFG++ is mutually exclusive
+    # with SMC-CFG (both own sampler_cfg_function). The σ schedule is recomputed
+    # the way comfy.sample.sample will inside the loop, so the indices/weights
+    # line up. SPD re-spaces σ mid-loop, so neither composes with it.
+    do_cfg = not math.isclose(cfg, 1.0)
+    smc_active = smc_cfg_alpha > 0.0 and do_cfg
+    fsg = None
+    fsg_steps: frozenset = frozenset()
+    want_cfgpp = cfgpp_lambda and cfgpp_lambda > 0.0
+    spd_will_own_loop = bool(spd_stages) or (0.0 < spd_scale < 1.0 and 0.0 < spd_sigma < 1.0)
+    if (want_cfgpp or fsg_enabled) and not do_cfg:
+        logger.warning("CFG++/FSG need CFG (cfg != 1.0); ignoring.")
+        want_cfgpp = fsg_enabled = False
+    if (want_cfgpp or fsg_enabled) and spd_will_own_loop:
+        logger.warning("CFG++/FSG are not wired into SPD/SPEED; ignoring.")
+        want_cfgpp = fsg_enabled = False
+
+    if want_cfgpp or fsg_enabled:
+        ks_sched = comfy.samplers.KSampler(
+            m,
+            steps=steps,
+            device=m.load_device,
+            sampler=sampler_name,
+            scheduler=scheduler,
+            denoise=denoise,
+        )
+        sigma_schedule = [float(s) for s in ks_sched.sigmas]
+
+        if want_cfgpp:
+            if smc_active:
+                logger.warning(
+                    "CFG++ and SMC-CFG both replace the cond/uncond combine; "
+                    "ignoring CFG++ (SMC-CFG is active)."
+                )
+            else:
+                install_cfgpp(m, lam=float(cfgpp_lambda), sigmas=sigma_schedule)
+                logger.info("CFG++ substrate active (λ=%.3g).", cfgpp_lambda)
+
+        if fsg_enabled:
+            fsg = FSGCalibrator(
+                band=tuple(fsg_band),
+                k=int(fsg_k),
+                d_sigma=float(fsg_d_sigma),
+                gamma=(float(fsg_gamma) if fsg_gamma and fsg_gamma > 0.0 else None),
+            )
+            fsg_steps = fsg_step_indices(fsg, sigma_schedule, steps)
+            install_fsg(m, fsg=fsg, guidance_scale=cfg)
+            logger.info(
+                "FSG active: band=[%.2f, %.2f], K=%d, Δσ=%.3g, %d in-band steps "
+                "(+~%d fwd).",
+                fsg.band[0], fsg.band[1], fsg.k, fsg.d_sigma, len(fsg_steps),
+                3 * fsg.k * len(fsg_steps),
+            )
+
     # SEA schedule: resolve the auto-δ target + load any cached δ for this config.
     # An uncached config runs one window-scheduled calibration pass (full compute)
     # then persists δ; later generates at the same config use the SEA trigger.
@@ -754,8 +846,24 @@ def spectrum_sample(
             int(latent_image["samples"].shape[-2]),
             int(latent_image["samples"].shape[-1]),
         )
+        # CFG++ λ and the FSG forced-step set move the trajectory δ is
+        # calibrated against, so fold them into the key — a plain run and an
+        # fsg/cfg++ run at the same geometry must never share a cached δ.
+        sea_extra = ""
+        if want_cfgpp and not smc_active:
+            sea_extra += f"cfgpp{round(float(cfgpp_lambda), 4)}"
+        if fsg is not None:
+            sea_extra += f"fsg{sorted(fsg_steps)}k{fsg.k}d{round(fsg.d_sigma, 3)}"
         sea_key = _sea.make_cache_key(
-            steps, warmup_steps, stop_at, refresh_ratio, cfg, sampler_name, h_lat, w_lat
+            steps,
+            warmup_steps,
+            stop_at,
+            refresh_ratio,
+            cfg,
+            sampler_name,
+            h_lat,
+            w_lat,
+            extra=sea_extra,
         )
         sea_delta = _sea.load_delta(sea_key)
         logger.info(
@@ -779,6 +887,7 @@ def spectrum_sample(
         refresh_ratio=refresh_ratio,
         sea_beta=sea_beta,
         delta=sea_delta,
+        fsg_steps=fsg_steps,
     )
 
     dit = m.model.diffusion_model
