@@ -32,37 +32,14 @@ See anima_lora/docs/methods/smc_cfg.md for the full derivation and the
 
 from __future__ import annotations
 
-from typing import Optional
-
 import torch
 
-
-class SMCCFGState:
-    def __init__(self, lam: float = 5.0, alpha: float = 0.1):
-        self.lam = float(lam)
-        self.alpha = float(alpha)
-        self._e_prev: Optional[torch.Tensor] = None
-
-    def combine_v(
-        self,
-        v_cond: torch.Tensor,
-        v_uncond: torch.Tensor,
-        guidance_scale: float,
-    ) -> torch.Tensor:
-        e = v_cond - v_uncond
-        # Resolution can change mid-loop (SPD/SPEED spectral expansion at the
-        # low→full handoff): the stored previous-step residual then carries a
-        # stale spatial shape and can't form the sliding surface. Treat the
-        # handoff as a cold start — drop the stale history, like Spectrum's
-        # reset() at the same boundary.
-        if self._e_prev is not None and self._e_prev.shape != e.shape:
-            self._e_prev = None
-        e_prev = e if self._e_prev is None else self._e_prev
-        s = (e - e_prev) + self.lam * e_prev
-        k_t = self.alpha * e.abs().mean().clamp_min(1e-12)
-        delta_e = -k_t * torch.sign(s)
-        self._e_prev = e.detach()
-        return v_uncond + guidance_scale * (e + delta_e)
+# SMC-CFG combine is pure compute — the library module is already torch-only with
+# no anima/comfy deps, so it IS the shared core (no separate *_core split).
+# Resolved against the live tree or the ``_vendor/`` subset by the sys.path
+# bootstrap in ``__init__.py``. ``combine`` operates in velocity space; the
+# ``_make_smc_cfg_function`` seam below converts denoised↔v-space around it.
+from library.inference.corrections.smc_cfg import SMCCFGState
 
 
 def _make_smc_cfg_function(state: SMCCFGState):
@@ -93,7 +70,7 @@ def _make_smc_cfg_function(state: SMCCFGState):
 
         v_cond = (x_in - cond_denoised) / sig
         v_uncond = (x_in - uncond_denoised) / sig
-        v_out = state.combine_v(v_cond, v_uncond, cond_scale)
+        v_out = state.combine(v_cond, v_uncond, cond_scale)
         return sig * v_out
 
     return cfg_function

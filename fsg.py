@@ -32,37 +32,28 @@ diverges; the paper's noisy-stage prescription is wrong on Anima).
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 import torch
 
 import comfy.patcher_extension
 import comfy.samplers
 
+# Shared pure-compute core: the FSG config gate + fixed-point loop and the CFG++
+# guidance weight. Resolved against the live anima_lora tree (dev install) or the
+# bundled ``_vendor/`` subset (standalone) by the sys.path bootstrap in
+# ``__init__.py``. The math is the single source of truth — only the velocity
+# *source* (calc_cond_batch, below) is node-specific.
+from library.inference.corrections.fsg_core import (
+    FSGCalibrator as _FSGCalibratorCore,
+)
+from library.inference.corrections.fsg_core import cfgpp_guidance_weight
+
 logger = logging.getLogger(__name__)
 
 
 # --- CFG++ substrate ------------------------------------------------------
-
-
-def cfgpp_guidance_weight(sigma_i: float, sigma_next: float, lam: float) -> float:
-    """CFG++ effective guidance weight for one step (integrator-agnostic).
-
-    CFG++ differs from CFG *only* in guidance-strength scheduling (paper App
-    A.2): both add ``weight·(v^c − v^u)`` to the update, CFG with a constant
-    ``w``, CFG++ with the σ-scheduled weight. The flow-matching form is
-
-        w_eff = λ · (1 − σ_next) · σ_i / (σ_i − σ_next)
-
-    Applied as ``noise_pred = v^u + w_eff·(v^c − v^u)`` it composes with any
-    integrator (Euler, ER-SDE): the sampler consumes the reweighted prediction
-    unchanged. At the final step (σ_next → 0) it collapses to ``w_eff = λ``.
-    """
-    ds = sigma_i - sigma_next
-    if ds <= 0.0:
-        return lam
-    return lam * (1.0 - sigma_next) * sigma_i / ds
+# ``cfgpp_guidance_weight`` is imported from the shared core above.
 
 
 class CFGPPState:
@@ -145,28 +136,14 @@ def _clean_model_options(model_options: dict) -> dict:
     return opts
 
 
-@dataclass
-class FSGCalibrator:
-    """Forward-backward fixed-point calibrator, scheduled over a σ-band.
+class FSGCalibrator(_FSGCalibratorCore):
+    """FSG calibrator bound to ComfyUI's ``calc_cond_batch`` velocity source.
 
-    Args mirror the library plugin: ``band`` (σ_lo, σ_hi) gate, ``k`` iterations
-    (k=0 inert), ``d_sigma`` the forward-backward stride Δσ (too large → σ≈0.94
-    diverges), ``gamma`` the calibration guidance (None → outer guidance_scale).
+    Inherits ``band`` / ``k`` / ``d_sigma`` / ``gamma`` config, the ``scheduled``
+    σ-band gate, and the pure ``run_fixed_point`` loop from the shared core. Only
+    the velocity source is node-specific: velocities are recovered from the
+    denoised predictions — for CONST/flow model_sampling ``v = (x − x0)/σ``.
     """
-
-    band: Tuple[float, float] = (0.59, 0.75)
-    k: int = 3
-    d_sigma: float = 0.1
-    gamma: Optional[float] = None
-
-    def __post_init__(self) -> None:
-        self.k = int(self.k)
-        self.d_sigma = float(self.d_sigma)
-        self.band = (float(self.band[0]), float(self.band[1]))
-
-    def scheduled(self, sigma_i: float) -> bool:
-        lo, hi = self.band
-        return self.k > 0 and lo <= float(sigma_i) <= hi
 
     @torch.no_grad()
     def calibrate(
@@ -182,32 +159,24 @@ class FSGCalibrator:
         """Return ``x̂`` after K forward-backward iterations.
 
         ``conds == [cond, uncond]`` (the list ComfyUI's ``sampling_function``
-        hands to ``calc_cond_batch``). Velocities are recovered from the
-        denoised predictions: for CONST/flow model_sampling ``v = (x − x0)/σ``.
-        Costs ~3·K extra forwards per scheduled step (cond+uncond at σ batched,
-        uncond at σ−Δσ).
+        hands to ``calc_cond_batch``). Costs ~3·K extra forwards per scheduled
+        step (cond+uncond at σ batched in one call, uncond at σ−Δσ).
         """
-        gamma = float(guidance_scale) if self.gamma is None else float(self.gamma)
-        ds = self.d_sigma
-        s_lo = max(float(sigma_i) - ds, 1e-3)
         uncond = conds[1]
 
-        cur = x.clone()
-        for _ in range(self.k):
-            t_i = timestep_ref.new_full((cur.shape[0],), float(sigma_i))
-            out = comfy.samplers.calc_cond_batch(model, conds, cur, t_i, clean_options)
-            vc = (cur - out[0]) / sigma_i
-            vu = (cur - out[1]) / sigma_i
-            vg = vu + gamma * (vc - vu)
-            x_fwd = cur - ds * vg  # denoise σ → σ−Δσ (guided)
+        def vel_cond_uncond(cur, sigma):
+            t = timestep_ref.new_full((cur.shape[0],), float(sigma))
+            out = comfy.samplers.calc_cond_batch(model, conds, cur, t, clean_options)
+            return (cur - out[0]) / sigma, (cur - out[1]) / sigma
 
-            t_lo = timestep_ref.new_full((cur.shape[0],), s_lo)
-            out_lo = comfy.samplers.calc_cond_batch(
-                model, [uncond], x_fwd, t_lo, clean_options
-            )
-            vu_lo = (x_fwd - out_lo[0]) / s_lo
-            cur = x_fwd + ds * vu_lo  # invert back (uncond)
-        return cur.to(x.dtype)
+        def vel_uncond(cur, sigma):
+            t = timestep_ref.new_full((cur.shape[0],), float(sigma))
+            out = comfy.samplers.calc_cond_batch(model, [uncond], cur, t, clean_options)
+            return (cur - out[0]) / sigma
+
+        return self.run_fixed_point(
+            x, sigma_i, guidance_scale, vel_cond_uncond, vel_uncond
+        )
 
 
 def fsg_step_indices(fsg: FSGCalibrator, sigmas: List[float], num_steps: int) -> frozenset:

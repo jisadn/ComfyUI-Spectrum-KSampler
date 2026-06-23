@@ -28,73 +28,24 @@ import torch
 
 import comfy.patcher_extension
 
-logger = logging.getLogger(__name__)
+# Pure-compute DCW math (band-name set, ``all`` mask parsing, single-level
+# orthonormal Haar DWT/iDWT) from the shared anima_lora core — resolved against
+# the live tree or the ``_vendor/`` subset by the sys.path bootstrap in
+# __init__.py. The bit-sensitive Haar transforms are the single source of truth;
+# only the ComfyUI in-place / hook plumbing below is node-specific.
+from networks.dcw import (
+    ALL_BANDS,
+    _haar_dwt_2d,
+    _haar_idwt_2d,
+    parse_band_mask,
+)
 
-BANDS = ("LL", "LH", "HL", "HH")
-ALL_BANDS = frozenset(BANDS)
+logger = logging.getLogger(__name__)
 
 _ODD_SHAPE_WARNED = False
 
 
-def parse_band_mask(label: str) -> frozenset[str]:
-    """CLI / widget string → frozenset of band names. ``all`` → all four bands.
-
-    Format: ``LL``, ``HH``, ``LH+HL+HH``, ``all``. Case-insensitive on
-    band names; ``all`` must be exactly that token.
-    """
-    if label == "all":
-        return ALL_BANDS
-    parts = [p.upper() for p in label.split("+") if p]
-    bad = [p for p in parts if p not in BANDS]
-    if bad or not parts:
-        raise ValueError(
-            f"unknown band(s) in mask {label!r}: {bad or '<empty>'}; "
-            f"valid bands {BANDS!r} or 'all'"
-        )
-    return frozenset(parts)
-
-
-def _haar_dwt_2d(
-    v: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Single-level 2D orthonormal Haar DWT on the last two dims.
-
-    Returns (LL, LH, HL, HH), each (..., H/2, W/2). Requires even H, W.
-    """
-    a = v[..., 0::2, 0::2]
-    b = v[..., 0::2, 1::2]
-    c = v[..., 1::2, 0::2]
-    d = v[..., 1::2, 1::2]
-    s = 0.5
-    LL = (a + b + c + d) * s
-    LH = (a + b - c - d) * s
-    HL = (a - b + c - d) * s
-    HH = (a - b - c + d) * s
-    return LL, LH, HL, HH
-
-
-def _haar_idwt_2d(
-    LL: torch.Tensor, LH: torch.Tensor, HL: torch.Tensor, HH: torch.Tensor
-) -> torch.Tensor:
-    s = 0.5
-    a = (LL + LH + HL + HH) * s
-    b = (LL + LH - HL - HH) * s
-    c = (LL - LH + HL - HH) * s
-    d = (LL - LH - HL + HH) * s
-    out = torch.empty(
-        *LL.shape[:-2], LL.shape[-2] * 2, LL.shape[-1] * 2,
-        dtype=LL.dtype, device=LL.device,
-    )
-    out[..., 0::2, 0::2] = a
-    out[..., 0::2, 1::2] = b
-    out[..., 1::2, 0::2] = c
-    out[..., 1::2, 1::2] = d
-    return out
-
-
-def _band_masked_diff(
-    diff: torch.Tensor, bands: frozenset[str]
-) -> torch.Tensor:
+def _band_masked_diff(diff: torch.Tensor, bands: frozenset[str]) -> torch.Tensor:
     """DWT → zero non-mask bands → iDWT. Caller guarantees even H, W."""
     LL, LH, HL, HH = _haar_dwt_2d(diff)
     z = torch.zeros_like(LL)
@@ -198,6 +149,12 @@ def _make_dcw_calc_cond_batch_wrapper(state: DCWState):
                     )
             state.curr_sigma = sigma
             state.step_idx += 1
+            # v6 (fei_replace/fei_concat) calibrators read the 2-band FEI of the
+            # latent *entering* this step (pre-forward, post-correction), matching
+            # the CLI's record_latent_pre_forward timing. No-op for v5/scalar
+            # (fei_obs="off") and past warmup, so the v5 path stays bit-identical.
+            if state.auto:
+                state.calibrator.record_latent_pre_forward(state.step_idx, x_in)
         # Cache x_in *after* correction; post-CFG hook needs it to recover the
         # post-CFG velocity v = (x_in - denoised) / σ for haar_LL_norm.
         if state.auto:
