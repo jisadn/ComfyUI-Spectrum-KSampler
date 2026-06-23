@@ -241,8 +241,8 @@ def _compute_t_emb(dit, t):
     p = next(te[1].parameters(), None)
     wdt = p.dtype if p is not None else t.dtype
     t_bt = t.reshape(-1, 1) if t.ndim == 1 else t
-    sin = te[0](t_bt)             # Timesteps -> fp32
-    emb = te[1](sin.to(wdt))      # cast to embedder weight dtype, then its linears
+    sin = te[0](t_bt)  # Timesteps -> fp32
+    emb = te[1](sin.to(wdt))  # cast to embedder weight dtype, then its linears
     if isinstance(emb, (tuple, list)):
         emb = emb[0]
     emb = dit.t_embedding_norm(emb)
@@ -262,8 +262,8 @@ class _PerBlockState:
 
     def __init__(self, delta_unit: torch.Tensor, schedule: List[float], final_w: float):
         self.delta_unit = delta_unit  # (1, C) — proj_tag - proj_neg
-        self.schedule = schedule       # length num_blocks; w_l per block
-        self.final_w = final_w         # scalar w applied to final_layer
+        self.schedule = schedule  # length num_blocks; w_l per block
+        self.final_w = final_w  # scalar w applied to final_layer
 
 
 class ModGuidanceState:
@@ -288,6 +288,9 @@ class ModGuidanceState:
         pos_raw: torch.Tensor,
         pos_t5_ids: Optional[torch.Tensor],
         pos_t5_weights: Optional[torch.Tensor],
+        qneg_raw: torch.Tensor,
+        qneg_t5_ids: Optional[torch.Tensor],
+        qneg_t5_weights: Optional[torch.Tensor],
         dit,
         start_layer: int = 0,
         end_layer: int = 27,
@@ -306,6 +309,15 @@ class ModGuidanceState:
         self.pos_raw = pos_raw
         self.pos_t5_ids = pos_t5_ids
         self.pos_t5_weights = pos_t5_weights
+        # Quality-negative baseline for the steering axis (delta = proj_tag -
+        # proj_qneg). Decoupled from the CFG negative, which keeps its own role
+        # as the uncond base projection. `_qneg_is_neg` is True when the caller
+        # left quality_neg empty and we reuse the CFG negative tensors — then the
+        # delta is bit-for-bit identical to the pre-decoupling behavior.
+        self.qneg_raw = qneg_raw
+        self.qneg_t5_ids = qneg_t5_ids
+        self.qneg_t5_weights = qneg_t5_weights
+        self._qneg_is_neg = qneg_raw is neg_raw
         self.dit = dit
         self.start_layer = int(start_layer)
         self.end_layer = int(end_layer)
@@ -313,18 +325,19 @@ class ModGuidanceState:
         self.taper_scale = float(taper_scale)
         self.final_w = float(final_w)
         # Computed lazily on first forward when DiT is on GPU
-        self.cond_combined: Optional[torch.Tensor] = None      # (1, C) base proj_pos
-        self.uncond_combined: Optional[torch.Tensor] = None    # (1, C) base proj_neg
-        self.delta_unit: Optional[torch.Tensor] = None         # (1, C) proj_tag - proj_neg
+        self.cond_combined: Optional[torch.Tensor] = None  # (1, C) base proj_pos
+        self.uncond_combined: Optional[torch.Tensor] = None  # (1, C) base proj_neg
+        self.delta_unit: Optional[torch.Tensor] = None  # (1, C) proj_tag - proj_neg
         self.per_block_schedule: Optional[List[float]] = None  # length num_blocks
         # σ-FiLM: when the adapter carries a FiLM generator, the projections are
         # timestep-dependent and cannot be precomputed once — the wrapper
         # recomputes them per step from these cached pooled vectors + state.
         self.has_film: bool = False
-        self.adapter_state: Optional[dict] = None              # typed, on device
-        self.tag_pooled: Optional[torch.Tensor] = None         # (1, pooled_dim)
+        self.adapter_state: Optional[dict] = None  # typed, on device
+        self.tag_pooled: Optional[torch.Tensor] = None  # (1, pooled_dim)
         self.neg_pooled: Optional[torch.Tensor] = None
         self.pos_pooled: Optional[torch.Tensor] = None
+        self.qneg_pooled: Optional[torch.Tensor] = None  # quality-neg baseline
 
     def _encode_pool(self, raw, t5_ids, t5_weights, device, dtype):
         # The DiT's llm_adapter can live on a different device than the sampling
@@ -336,9 +349,13 @@ class ModGuidanceState:
         adapter_device = next(self.dit.llm_adapter.parameters()).device
         adapted = self.dit.preprocess_text_embeds(
             raw.unsqueeze(0).to(device=adapter_device, dtype=dtype),
-            t5_ids.unsqueeze(0).to(device=adapter_device) if t5_ids is not None else None,
+            t5_ids.unsqueeze(0).to(device=adapter_device)
+            if t5_ids is not None
+            else None,
             t5xxl_weights=(
-                t5_weights.unsqueeze(0).unsqueeze(-1).to(device=adapter_device, dtype=dtype)
+                t5_weights.unsqueeze(0)
+                .unsqueeze(-1)
+                .to(device=adapter_device, dtype=dtype)
                 if t5_weights is not None
                 else None
             ),
@@ -362,16 +379,29 @@ class ModGuidanceState:
             pos_pooled = self._encode_pool(
                 self.pos_raw, self.pos_t5_ids, self.pos_t5_weights, device, dtype
             )
+            # Quality-negative pool feeds ONLY the steering delta. Reuse the CFG
+            # negative pool when quality_neg was left empty (legacy behavior).
+            qneg_pooled = (
+                neg_pooled
+                if self._qneg_is_neg
+                else self._encode_pool(
+                    self.qneg_raw, self.qneg_t5_ids, self.qneg_t5_weights, device, dtype
+                )
+            )
             proj_tag = _project(tag_pooled, adapter_state)
             proj_neg = _project(neg_pooled, adapter_state)
             proj_pos = _project(pos_pooled, adapter_state)
+            proj_qneg = (
+                proj_neg if self._qneg_is_neg else _project(qneg_pooled, adapter_state)
+            )
             # Base projections — added uniformly via t_embedding_norm hook,
-            # matches the line-1640 training-time injection.
-            self.cond_combined = proj_pos.detach()       # (1, C)
-            self.uncond_combined = proj_neg.detach()     # (1, C)
+            # matches the line-1640 training-time injection. uncond stays the CFG
+            # negative; the quality axis uses proj_qneg.
+            self.cond_combined = proj_pos.detach()  # (1, C)
+            self.uncond_combined = proj_neg.detach()  # (1, C)
             # Unit steering direction — scaled per-block by `self.per_block_schedule`.
             # σ-flat fallback value; the wrapper overrides it per step when FiLM.
-            self.delta_unit = (proj_tag - proj_neg).detach()
+            self.delta_unit = (proj_tag - proj_qneg).detach()
             # Cache pooled + typed state so the wrapper can recompute σ-conditioned
             # projections each step when the adapter is a σ-FiLM head.
             self.has_film = _adapter_has_film(adapter_state)
@@ -387,6 +417,9 @@ class ModGuidanceState:
                 self.tag_pooled = tag_pooled.detach()
                 self.neg_pooled = neg_pooled.detach()
                 self.pos_pooled = pos_pooled.detach()
+                self.qneg_pooled = (
+                    self.neg_pooled if self._qneg_is_neg else qneg_pooled.detach()
+                )
         self._build_schedule()
         logger.info(
             f"Mod guidance: precomputed "
@@ -469,6 +502,7 @@ def _ensure_block_hooks(dm) -> None:
             new_t_emb = t_emb + (w_l * delta).unsqueeze(1)
             new_args = (args[0], new_t_emb) + tuple(args[2:])
             return new_args, kwargs
+
         return _prehook
 
     def _final_prehook(module, args, kwargs):
@@ -504,14 +538,20 @@ def _mod_apply_wrapper(executor, *args, **kwargs):
     Positional args (from `BaseModel.apply_model`):
         (x, t, c_concat, c_crossattn, control, transformer_options, **extra_conds)
     """
-    transformer_options = args[5] if len(args) > 5 and isinstance(args[5], dict) else kwargs.get("transformer_options", {})
+    transformer_options = (
+        args[5]
+        if len(args) > 5 and isinstance(args[5], dict)
+        else kwargs.get("transformer_options", {})
+    )
     mod_state = transformer_options.get(MOD_STATE_KEY)
     if mod_state is None:
         # The wrapper is only ever installed by setup_mod_guidance, so reaching
         # here means MOD_STATE_KEY was dropped from transformer_options between
         # setup and sampling — mod guidance silently no-ops. Warn once.
         owner = getattr(executor, "class_obj", None)
-        if owner is not None and not getattr(owner, "_anima_mod_state_missing_warned", False):
+        if owner is not None and not getattr(
+            owner, "_anima_mod_state_missing_warned", False
+        ):
             logger.warning(
                 "[mod-guidance] wrapper fired but MOD_STATE_KEY missing from "
                 "transformer_options -> mod guidance is a NO-OP this run. "
@@ -539,7 +579,8 @@ def _mod_apply_wrapper(executor, *args, **kwargs):
         logger.info(
             "[mod-guidance] re-homing to live diffusion_model "
             "(captured id=%x != live id=%x); installing hooks on live module.",
-            id(mod_state.dit) & 0xffffff, id(dit) & 0xffffff,
+            id(mod_state.dit) & 0xFFFFFF,
+            id(dit) & 0xFFFFFF,
         )
         mod_state.dit = dit
         mod_state.cond_combined = None  # invalidate precompute against stale module
@@ -566,17 +607,20 @@ def _mod_apply_wrapper(executor, *args, **kwargs):
             pos_p = mod_state.pos_pooled.to(device)
             neg_p = mod_state.neg_pooled.to(device)
             tag_p = mod_state.tag_pooled.to(device)
+            qneg_p = mod_state.qneg_pooled.to(device)
             pieces = []
             for i, cou in enumerate(cond_or_uncond):
                 ti = t_emb[i : i + 1] if t_emb.shape[0] > i else t_emb[:1]
+                # uncond base row stays the CFG negative.
                 pooled_i = pos_p if cou == 0 else neg_p
                 # fp32 compute, cast to block dtype on the way out.
                 pieces.append(_project_film(pooled_i, state, ti, dtype))
             combined = torch.cat(pieces, dim=0)  # (B, C)
-            # Steering delta at this σ (cond row; CFG cond/uncond share σ).
+            # Steering delta at this σ (cond row; CFG cond/uncond share σ). Uses
+            # the decoupled quality-negative baseline, not the CFG negative.
             t0 = t_emb[:1]
             delta_unit_typed = _project_film(tag_p, state, t0, dtype) - _project_film(
-                neg_p, state, t0, dtype
+                qneg_p, state, t0, dtype
             )
         except Exception as e:  # graceful: degrade to σ-flat, warn once
             combined = None
@@ -594,7 +638,10 @@ def _mod_apply_wrapper(executor, *args, **kwargs):
                     "[mod-guidance] σ-FiLM recompute fell back to σ-flat (v5 fp32-head): "
                     "%s [t=%s, t_embedder=%s, adapter=%s]. If you just edited the node, "
                     "RESTART the ComfyUI server — re-queuing does NOT reload Python modules.",
-                    e, args[1].dtype, tedt, adt,
+                    e,
+                    args[1].dtype,
+                    tedt,
+                    adt,
                 )
                 dit._anima_film_fallback_warned = True
 
@@ -652,6 +699,7 @@ def setup_mod_guidance(
     quality_tags,
     w,
     *,
+    quality_neg: str = "",
     start_layer: int = 0,
     end_layer: int = 27,
     taper: int = 0,
@@ -666,6 +714,10 @@ def setup_mod_guidance(
     DiT is on GPU) and produce the cached `cond_combined` / `uncond_combined`
     base projections plus `delta_unit` steering direction stored on
     `ModGuidanceState`.
+
+    quality_neg gives the steering axis its own negative baseline (delta =
+    proj(quality_tags) - proj(quality_neg)), decoupled from the CFG negative.
+    Empty string falls back to the CFG negative (legacy behavior).
 
     Schedule params (per-block guidance shape):
         start_layer:  inclusive; first block to receive `w * delta_unit`.
@@ -703,6 +755,25 @@ def setup_mod_guidance(
     pos_raw, pos_t5_ids, pos_t5_weights = _extract_raw_and_t5(positive)
     neg_raw, neg_t5_ids, neg_t5_weights = _extract_raw_and_t5(negative)
 
+    # Quality-negative baseline for the steering axis. When provided, tokenize it
+    # through CLIP exactly like quality_tags so delta = proj(quality_pos) -
+    # proj(quality_neg) is a clean quality counter-pole instead of the broad CFG
+    # negative (which is anti-correlated with the quality axis — see
+    # docs/proposal/mod_guidance_decoupled_negative.md). Empty → reuse the CFG
+    # negative tensors, reproducing the pre-decoupling behavior bit-for-bit.
+    if quality_neg and quality_neg.strip():
+        qtokens = clip.tokenize(quality_neg)
+        qout = clip.encode_from_tokens(qtokens, return_pooled=True, return_dict=True)
+        qneg_raw = qout["cond"][0].detach().cpu()
+        qneg_t5_ids = qout.get("t5xxl_ids")
+        if qneg_t5_ids is not None:
+            qneg_t5_ids = qneg_t5_ids.detach().cpu()
+        qneg_t5_weights = qout.get("t5xxl_weights")
+        if qneg_t5_weights is not None:
+            qneg_t5_weights = qneg_t5_weights.detach().cpu()
+    else:
+        qneg_raw, qneg_t5_ids, qneg_t5_weights = neg_raw, neg_t5_ids, neg_t5_weights
+
     mod_state = ModGuidanceState(
         adapter_path=adapter_path,
         w=w,
@@ -715,6 +786,9 @@ def setup_mod_guidance(
         pos_raw=pos_raw,
         pos_t5_ids=pos_t5_ids,
         pos_t5_weights=pos_t5_weights,
+        qneg_raw=qneg_raw,
+        qneg_t5_ids=qneg_t5_ids,
+        qneg_t5_weights=qneg_t5_weights,
         dit=dm,
         start_layer=start_layer,
         end_layer=end_layer,

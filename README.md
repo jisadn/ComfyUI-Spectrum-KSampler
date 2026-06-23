@@ -6,7 +6,7 @@ Tuned for the [Anima](https://github.com/sorryhyun/anima_lora) DiT — its modul
 
 ## Contents
 
-- [How it works](#how-it-works) — Chebyshev forecasting, adaptive window schedule
+- [How it works](#how-it-works) — Chebyshev forecasting, adaptive window schedule, SEA scheduling
 - [Usage](#usage) — node placement, sampler compatibility
   - [Standalone MODEL patcher](#standalone-model-patcher) — wire Spectrum before stock samplers
 - [Parameters](#parameters) — Spectrum knobs + tuning tips
@@ -33,9 +33,27 @@ The window size N starts at `window_size` and grows by `flex_window` after each 
 
 With 28 steps and defaults: ~**8 actual forwards** out of 28 total steps.
 
+### SEA scheduling (content-aware skip decision)
+
+The growing window above is content-blind — it spends compute on a fixed cadence regardless of what the trajectory is doing. The **SEA** (Spectral-Evolution-Aware, SeaCache) schedule instead refreshes when the accumulated SEA-filtered latent distance crosses a calibrated threshold δ, so actual forwards land on the steps that actually move content.
+
+The **KSampler (Spectrum)** node selects it via the `refresh_ratio` dial:
+
+- `-1` → SEA off: the plain growing window above. Accelerates from the first run, no calibration.
+- `0` (default) → SEA auto: δ is calibrated so the refresh fraction matches the growing window at this step count — **same speed**, smarter step placement.
+- `>0` → explicit refresh ratio. Lower = fewer actual forwards = faster, less faithful.
+
+The first run at each `(resolution / steps / cfg / refresh_ratio)` does a one-time full-compute calibration pass to fit δ, then caches it to the ComfyUI user dir; later runs at that config get the fast SEA trigger. δ generalizes across mod-guidance, so calibrating with mod active stays valid. SEA is incompatible with the SPEED/SPD node (mid-loop σ re-spacing breaks the distance trace) and transparently falls back to the window schedule there.
+
 ## Usage
 
-Place the **KSampler (Spectrum)** node where you'd normally use a KSampler. It has the same inputs (model, seed, steps, cfg, sampler, scheduler, conditioning, latent) plus Spectrum-specific parameters.
+Place the **KSampler (Spectrum)** node where you'd normally use a KSampler. It has the same inputs (model, seed, steps, cfg, sampler, scheduler, conditioning, latent) plus Spectrum-specific parameters. This single node now folds in what used to be three separate nodes:
+
+- **Modulation guidance** — wire a `CLIP` and pick a `mod_w_profile` (default `step_i8_skip27`; `off` to disable). With no CLIP connected and a profile selected, mod guidance is skipped with a console warning rather than erroring — so a graph that only wires the sampler still runs.
+- **SEA scheduling** — the `refresh_ratio` dial chooses *which* steps to skip: `0` (default) = SEA auto (content-aware, compute-matched to the growing window), `-1` = SEA off (plain growing window, accelerates from the first run with no calibration), `>0` = explicit refresh ratio.
+- **α-adaptive SMC-CFG** — `adaptive_smc_alpha`.
+
+> **Migration:** the former `KSampler (Spectrum + Mod Guidance)` and `KSampler (Spectrum SEA + Mod Guidance)` nodes are gone — their behavior is the default of this unified node. Their class keys remain as hidden aliases so existing saved workflows still load (they resolve to this node), but they no longer appear in the add-node menu. DCW + raw forecasting/guidance scalars still live on the **Advanced** node.
 
 Works with any ComfyUI sampler (Euler, DPM, er_sde, etc.) because caching is handled transparently inside a model function wrapper. Chains with other model wrappers (Flex Attention, Flash Attention 4, etc.).
 
@@ -81,15 +99,16 @@ Additional **DiT Spectrum Patch** parameters:
 
 ## Modulation guidance
 
-The **KSampler (Spectrum + Mod Guidance)** and **Advanced** variants add text-conditioned quality steering via a learned `pooled_text_proj` MLP adapter ([Starodubcev et al., ICLR 2026](https://arxiv.org/abs/2502.15349)). The adapter projects pooled text embeddings into a guidance delta that is injected into the DiT's AdaLN timestep embedding, steering generation toward the specified quality attributes.
+The **KSampler (Spectrum)** node (via `mod_w_profile`) and the **Advanced** node add text-conditioned quality steering via a learned `pooled_text_proj` MLP adapter ([Starodubcev et al., ICLR 2026](https://arxiv.org/abs/2502.15349)). The adapter projects pooled text embeddings into a guidance delta that is injected into the DiT's AdaLN timestep embedding, steering generation toward the specified quality attributes. The standalone **Anima Mod Guidance** patcher exposes the same profile surface as a `MODEL → MODEL` node so it composes with any sampler.
 
-The default ~12MB `pooled_text_proj` weight is auto-downloaded on first use from the [anima_lora release page](https://github.com/sorryhyun/anima_lora/releases/tag/mod_guidance) into `ComfyUI/models/anima_mod_guidance/`. The simple node always uses the default; the advanced node exposes an adapter dropdown where `(auto-download default)` triggers the same download or you can pick a custom adapter from `loras/`.
+The default ~12MB `pooled_text_proj` weight is auto-downloaded on first use from the [anima_lora release page](https://github.com/sorryhyun/anima_lora/releases/tag/mod_guidance) into `ComfyUI/models/anima_mod_guidance/`. The unified node always uses the default; the advanced node exposes an adapter dropdown where `(auto-download default)` triggers the same download or you can pick a custom adapter from `loras/`.
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `clip` | — | CLIP encoder for encoding quality tags |
 | `adapter` | `(auto-download default)` | `pooled_text_proj` safetensors file (advanced node only) |
-| `quality_tags` | `absurdres, highres, masterpiece, ...` | Quality/aesthetic tags to steer toward |
+| `quality_tags` | `absurdres, highres, masterpiece, ...` | Quality/aesthetic tags to steer toward (the steering axis's positive pole) |
+| `quality_neg` | _(empty)_ | Negative pole of the steering axis (`delta = proj(quality_tags) − proj(quality_neg)`). **Empty reuses the CFG negative** (legacy behavior). Set a clean counter-pole like `worst quality, score_1` to decouple the quality axis from the broad CFG negative — the shared negative is anti-correlated (~−0.38 cosine) with the intended quality direction and ~40% weaker. Does **not** touch the CFG negative. |
 | `mod_w_profile` (simple) | `step_i8_skip27` | Per-block guidance preset. `off` disables modulation guidance entirely (no adapter download, no extra hook). `step_i8_skip27` (default, best quality) protects blocks 0–7 + 27 and applies `w=3` to blocks 8–26. `step_i14` is the safe option — use it when a LoRA shows anatomy drift. `uniform_w3` recovers pre-0413 legacy behavior. |
 | `mod_w` (advanced) | 3.0 | Peak guidance strength applied per-block |
 | `mod_start_layer` (advanced) | 8 | First block (inclusive) that receives the steering delta. `0` = uniform legacy behavior |
@@ -100,9 +119,11 @@ The default ~12MB `pooled_text_proj` weight is auto-downloaded on first use from
 
 Per-block guidance schedules address quality drift on LoRAs whose distribution sits far from the positive-prompt axis (e.g. early blocks blowing out tonal DC into uniform color collapse). The default `step_i8_skip27` protects blocks 0–7 and the final compensation block 27 from the steering delta while keeping the base text projection uniform across all blocks. See [`docs/methods/mod-guidance.md`](https://github.com/sorryhyun/anima_lora/blob/main/docs/methods/mod-guidance.md) in anima_lora for the underlying rationale.
 
+**Decoupled negative (`quality_neg`).** The mod-guidance delta is `proj(quality_tags) − proj(negative)`. By default the node bound that negative to the **CFG** negative — the broad kitchen-sink list (`worst quality, …, sepia, speech bubble, borders, …`) whose job is velocity-space repulsion, not to be a clean quality counter-pole. Geometrically the resulting axis is *anti-correlated* (cos ≈ −0.38) with the intended `quality_up − quality_down` direction and ~40% smaller in magnitude, so the push both misdirects and weakens. Set `quality_neg` to a focused counter-pole (e.g. `worst quality, score_1`) to recover a pure quality axis; the CFG negative keeps its broad role unchanged. The mod-guidance head is max-pooled and trained on max-pooled inputs — `quality_neg` does **not** change pooling. Leaving it empty reproduces the pre-decoupling result bit-for-bit. (The anima_lora CLI was already decoupled via `--mod_neg_prompt`; this brings the Comfy node in line.)
+
 ## SMC-CFG (α-adaptive sliding-mode CFG)
 
-All three nodes expose an `adaptive_smc_alpha` knob (default `0.2`, set `0` to disable) that swaps the standard CFG combine for an **α-adaptive sliding-mode controller** ([Wang et al., arXiv:2603.03281](https://arxiv.org/abs/2603.03281), Anima α-adaptive form). The Advanced node additionally exposes `smc_cfg_lambda`. Auto-skipped when CFG = 1 (no cond/uncond residual to slide on).
+Every sampler node exposes an `adaptive_smc_alpha` knob (default `0.2`, set `0` to disable) that swaps the standard CFG combine for an **α-adaptive sliding-mode controller** ([Wang et al., arXiv:2603.03281](https://arxiv.org/abs/2603.03281), Anima α-adaptive form). The Advanced node additionally exposes `smc_cfg_lambda`. Auto-skipped when CFG = 1 (no cond/uncond residual to slide on).
 
 At each denoising step, with `e_t = v_cond − v_uncond`:
 
@@ -129,7 +150,7 @@ SMC-CFG operates in **velocity space** — it must, because σ varies per step a
 
 ## DCW post-step bias correction
 
-DCW is exposed on the **Advanced** node only and defaults to **off** — turn it on per-workflow when you want the correction. The basic and mod-guidance nodes do not run DCW; switch to **KSampler (Spectrum + Mod Guidance Advanced)** to access the full `dcw_mode` / `dcw_lambda` / `dcw_band_mask` / `dcw_calibrator` widgets. `dcw_mode = auto` runs the OnlineDCWCalibrator fusion head (per-prompt λ̂, auto-downloaded on first use); `manual` uses the scalar `dcw_lambda × schedule(σ)`; `off` disables.
+DCW is exposed on the **Advanced** node only and defaults to **off** — turn it on per-workflow when you want the correction. The unified **KSampler (Spectrum)** node does not run DCW; switch to **KSampler (Spectrum + Mod Guidance Advanced)** to access the full `dcw_mode` / `dcw_lambda` / `dcw_band_mask` / `dcw_calibrator` widgets. `dcw_mode = auto` runs the OnlineDCWCalibrator fusion head (per-prompt λ̂, auto-downloaded on first use); `manual` uses the scalar `dcw_lambda × schedule(σ)`; `off` disables.
 
 DCW ([Yu et al., CVPR 2026](https://arxiv.org/abs/2604.16044)) is a sampler-level post-step correction for the SNR-t bias of flow-matching DiTs. Each step's `prev_sample` is mixed toward (or away from) the post-CFG `x0_pred`, optionally restricted to a single-level Haar subband of the differential:
 

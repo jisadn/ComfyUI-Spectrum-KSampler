@@ -25,6 +25,7 @@ def _calibrator_choices():
     # as mod-guidance adapters). Auto-download lands in models/anima_dcw_calibrator/.
     return [AUTO_CALIBRATOR_SENTINEL] + folder_paths.get_filename_list("loras")
 
+
 # ---------------------------------------------------------------------------
 # Common input definitions
 # ---------------------------------------------------------------------------
@@ -56,7 +57,7 @@ _KSAMPLER_INPUTS = {
 _QUALITY_TAGS_INPUT = (
     "STRING",
     {
-        "default": "absurdres, highres, masterpiece, best quality, score_9, score_8, newest, year 2025, year 2024",
+        "default": "highres, best quality, score_7",
         "multiline": True,
         "dynamicPrompts": True,
         "tooltip": "Quality tags to steer generation toward via modulation.",
@@ -68,16 +69,43 @@ _QUALITY_TAGS_INPUT = (
 # end_layer = -1 means "all blocks" (resolved against num_blocks at setup time).
 MOD_W_PROFILE_OFF = "off"
 MOD_W_PROFILES = {
-    "step_i8_skip27": dict(w=3.0, start_layer=8,  end_layer=27, taper=0, taper_scale=0.25, final_w=0.0),
-    "step_i14":       dict(w=3.0, start_layer=14, end_layer=-1, taper=0, taper_scale=0.25, final_w=0.0),
-    "uniform_w3":     dict(w=3.0, start_layer=0,  end_layer=-1, taper=0, taper_scale=0.25, final_w=0.0),
+    "step_i8_skip27": dict(
+        w=3.0, start_layer=8, end_layer=27, taper=0, taper_scale=0.25, final_w=0.0
+    ),
+    "step_i14": dict(
+        w=3.0, start_layer=14, end_layer=-1, taper=0, taper_scale=0.25, final_w=0.0
+    ),
+    "uniform_w3": dict(
+        w=3.0, start_layer=0, end_layer=-1, taper=0, taper_scale=0.25, final_w=0.0
+    ),
 }
 DEFAULT_MOD_W_PROFILE = "step_i8_skip27"
 
 
-_MOD_GUIDANCE_SIMPLE_INPUTS = {
+_CLIP_INPUT = {
     "clip": ("CLIP", {"tooltip": "CLIP encoder for encoding positive quality tags."}),
+}
+
+_QUALITY_NEG_INPUT = (
+    "STRING",
+    {
+        "default": "score_1, score_2, score_3, worst quality, lowres, old, bad hands, bad anatomy",
+        "multiline": True,
+        "dynamicPrompts": True,
+        "tooltip": (
+            "Quality-negative baseline for the mod-guidance steering axis "
+            "(delta = proj(quality_tags) − proj(quality_neg)). Leave EMPTY to "
+            "reuse the CFG negative (legacy behavior). Set a clean counter-pole "
+            "(e.g. 'worst quality, score_1') to decouple the quality axis from "
+            "the broad CFG negative, which is anti-correlated with the intended "
+            "quality direction. Does NOT change the CFG negative itself."
+        ),
+    },
+)
+
+_MOD_PROFILE_INPUTS = {
     "quality_tags": _QUALITY_TAGS_INPUT,
+    "quality_neg": _QUALITY_NEG_INPUT,
     "mod_w_profile": (
         [MOD_W_PROFILE_OFF] + list(MOD_W_PROFILES.keys()),
         {
@@ -99,7 +127,7 @@ _MOD_GUIDANCE_SIMPLE_INPUTS = {
 
 def _mod_guidance_advanced_inputs():
     return {
-        "clip": _MOD_GUIDANCE_SIMPLE_INPUTS["clip"],
+        "clip": _CLIP_INPUT["clip"],
         "adapter": (
             _adapter_choices(),
             {
@@ -111,6 +139,7 @@ def _mod_guidance_advanced_inputs():
             },
         ),
         "quality_tags": _QUALITY_TAGS_INPUT,
+        "quality_neg": _QUALITY_NEG_INPUT,
         "mod_w": (
             "FLOAT",
             {
@@ -182,6 +211,7 @@ def _mod_guidance_advanced_inputs():
             },
         ),
     }
+
 
 _SPECTRUM_INPUTS = {
     "window_size": (
@@ -339,9 +369,7 @@ def _read_spd_schedule_meta(lora_name):
         stages = [float(v) for v in json.loads(raw_stages)] if raw_stages else None
         trans = [float(v) for v in json.loads(raw_trans)] if raw_trans else None
     except (ValueError, TypeError) as e:
-        logger.warning(
-            "SPD LoRA: malformed schedule metadata in %s: %s", lora_name, e
-        )
+        logger.warning("SPD LoRA: malformed schedule metadata in %s: %s", lora_name, e)
         return None, None, label
     return stages, trans, label
 
@@ -455,98 +483,105 @@ _DCW_INPUTS = {
 
 
 # ---------------------------------------------------------------------------
-# Nodes
+# Shared helpers
 # ---------------------------------------------------------------------------
 
 
-class SpectrumKSampler:
-    """Drop-in KSampler replacement with Spectrum acceleration using sensible defaults."""
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                **_KSAMPLER_INPUTS,
-                "adaptive_smc_alpha": _SMC_CFG_ALPHA_INPUT,
-            }
-        }
-
-    RETURN_TYPES = ("LATENT",)
-    FUNCTION = "sample"
-    CATEGORY = "sampling"
-    DESCRIPTION = (
-        "Spectrum-accelerated sampler. Drop-in KSampler replacement that "
-        "skips transformer blocks on predicted steps via Chebyshev polynomial "
-        "feature forecasting for ~2-3x speedup. Optional α-adaptive SMC-CFG "
-        "(default 0.2) modifies the CFG combine for detail recovery. DCW "
-        "lives on the Advanced node."
-    )
-
-    def sample(
-        self,
-        model,
-        seed,
-        steps,
-        cfg,
-        sampler_name,
-        scheduler,
+def _apply_mod_guidance(
+    model,
+    clip,
+    positive,
+    negative,
+    adapter,
+    quality_tags,
+    *,
+    quality_neg="",
+    w,
+    start_layer,
+    end_layer,
+    taper,
+    taper_scale,
+    final_w,
+):
+    """Clone `model` and install the mod-guidance hook with explicit scalars."""
+    m = model.clone()
+    setup_mod_guidance(
+        m,
+        clip,
         positive,
         negative,
-        latent_image,
-        denoise=1.0,
-        adaptive_smc_alpha=_SMC_CFG_ALPHA_DEFAULT,
-    ):
-        return spectrum_sample(
-            model,
-            seed,
-            steps,
-            cfg,
-            sampler_name,
-            scheduler,
-            positive,
-            negative,
-            latent_image,
-            denoise,
-            **_SPECTRUM_DEFAULTS,
-            dcw_mode="off",
-            smc_cfg_alpha=adaptive_smc_alpha,
-            smc_cfg_lambda=_SMC_CFG_LAMBDA_DEFAULT,
-        )
-
-
-class SpectrumKSamplerModGuidance:
-    """Spectrum sampler with modulation guidance — quality steering via learned projection."""
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                **_KSAMPLER_INPUTS,
-                **_MOD_GUIDANCE_SIMPLE_INPUTS,
-                "adaptive_smc_alpha": _SMC_CFG_ALPHA_INPUT,
-            }
-        }
-
-    RETURN_TYPES = ("LATENT",)
-    FUNCTION = "sample"
-    CATEGORY = "sampling"
-    DESCRIPTION = (
-        "Spectrum-accelerated sampler with modulation guidance. "
-        "Steers generation toward quality tags via a learned pooled-text "
-        "projection into the AdaLN timestep embedding. The default ~12MB "
-        "pooled_text_proj adapter is auto-downloaded on first use. Quality "
-        "tags are encoded through the full CLIP + LLM adapter pipeline for "
-        "correct post-adapter pooling. Uses sensible Spectrum defaults and "
-        "the 'step_i8' per-block guidance schedule (early-DC protected). "
-        "Optional α-adaptive SMC-CFG (default 0.2) modifies the CFG combine "
-        "for detail recovery. DCW lives on the Advanced node. "
-        "Set mod_w_profile='off' to skip mod guidance entirely."
+        adapter,
+        quality_tags,
+        w,
+        quality_neg=quality_neg,
+        start_layer=start_layer,
+        end_layer=end_layer,
+        taper=taper,
+        taper_scale=taper_scale,
+        final_w=final_w,
     )
+    return m
 
-    def sample(
-        self,
+
+def _apply_mod_profile(
+    model, clip, positive, negative, quality_tags, profile_name, quality_neg=""
+):
+    """Patch `model` with the named per-block guidance profile.
+
+    Returns the model unchanged when the profile is 'off'. If a profile is
+    selected but no CLIP is connected (e.g. a pre-unification workflow that only
+    wired the plain Spectrum sampler), mod guidance is skipped with a warning
+    rather than hard-erroring — so old graphs keep behaving like the basic node.
+    `quality_neg` (empty = reuse the CFG negative) decouples the steering axis.
+    """
+    if profile_name == MOD_W_PROFILE_OFF:
+        return model
+    if clip is None:
+        logger.warning(
+            "mod_w_profile=%r but no CLIP is connected — skipping mod guidance. "
+            "Wire a CLIP encoder to enable quality steering, or set "
+            "mod_w_profile='off' to silence this.",
+            profile_name,
+        )
+        return model
+    profile = MOD_W_PROFILES.get(profile_name) or MOD_W_PROFILES[DEFAULT_MOD_W_PROFILE]
+    return _apply_mod_guidance(
         model,
         clip,
+        positive,
+        negative,
+        None,
+        quality_tags,
+        quality_neg=quality_neg,
+        w=profile["w"],
+        start_layer=profile["start_layer"],
+        end_layer=profile["end_layer"],
+        taper=profile["taper"],
+        taper_scale=profile["taper_scale"],
+        final_w=profile["final_w"],
+    )
+
+
+def _run_spectrum(
+    model,
+    seed,
+    steps,
+    cfg,
+    sampler_name,
+    scheduler,
+    positive,
+    negative,
+    latent_image,
+    denoise,
+    *,
+    smc_alpha=_SMC_CFG_ALPHA_DEFAULT,
+    **extra,
+):
+    """spectrum_sample with the shared simple-node defaults (Spectrum presets,
+    DCW off, fixed SMC λ). `extra` carries node-specific knobs (schedule,
+    refresh_ratio, spd_*)."""
+    return spectrum_sample(
+        model,
         seed,
         steps,
         cfg,
@@ -555,81 +590,64 @@ class SpectrumKSamplerModGuidance:
         positive,
         negative,
         latent_image,
-        quality_tags,
-        mod_w_profile,
-        denoise=1.0,
-        adaptive_smc_alpha=_SMC_CFG_ALPHA_DEFAULT,
-    ):
-        if mod_w_profile == MOD_W_PROFILE_OFF:
-            m = model
-        else:
-            profile = MOD_W_PROFILES.get(mod_w_profile) or MOD_W_PROFILES[DEFAULT_MOD_W_PROFILE]
-            m = model.clone()
-            setup_mod_guidance(
-                m,
-                clip,
-                positive,
-                negative,
-                None,
-                quality_tags,
-                profile["w"],
-                start_layer=profile["start_layer"],
-                end_layer=profile["end_layer"],
-                taper=profile["taper"],
-                taper_scale=profile["taper_scale"],
-                final_w=profile["final_w"],
-            )
-        return spectrum_sample(
-            m,
-            seed,
-            steps,
-            cfg,
-            sampler_name,
-            scheduler,
-            positive,
-            negative,
-            latent_image,
-            denoise,
-            **_SPECTRUM_DEFAULTS,
-            dcw_mode="off",
-            smc_cfg_alpha=adaptive_smc_alpha,
-            smc_cfg_lambda=_SMC_CFG_LAMBDA_DEFAULT,
-        )
+        denoise,
+        **_SPECTRUM_DEFAULTS,
+        dcw_mode="off",
+        smc_cfg_alpha=smc_alpha,
+        smc_cfg_lambda=_SMC_CFG_LAMBDA_DEFAULT,
+        **extra,
+    )
 
 
-# refresh_ratio: the SEA speed dial. 0.0 = auto = match the growing-window
-# schedule's own refresh fraction at this step count (compute-matched — same
-# speed as the plain Spectrum mod-guidance node, just smarter about which steps
-# it spends compute on). A positive value below that fraction trades quality for
-# speed. Each distinct value calibrates + caches its own δ on first use.
-_SEA_REFRESH_RATIO_INPUT = (
+# refresh_ratio: the single dial that selects + tunes SEA scheduling.
+#   -1  → SEA off: plain growing-window schedule (accelerates from the first run,
+#         no calibration pass — the old basic/mod-node behavior).
+#    0  → SEA auto: match the window schedule's own refresh fraction at this step
+#         count (compute-matched — same speed, just smarter step placement).
+#   >0  → explicit SEA ratio (lower = faster, less faithful).
+# Each distinct config calibrates + caches its own δ on first use.
+_REFRESH_RATIO_INPUT = (
     "FLOAT",
     {
         "default": 0.0,
-        "min": 0.0,
+        "min": -1.0,
         "max": 1.0,
         "step": 0.01,
         "tooltip": (
-            "SEA refresh ratio — fraction of mid-trajectory steps that run a real "
-            "forward. 0 = auto (match the growing-window schedule at this step "
-            "count; same speed as the non-SEA node). Lower = faster, less faithful. "
-            "First run at each (resolution / steps / cfg / refresh_ratio) does a "
-            "one-time full-compute calibration pass, then caches δ to the ComfyUI "
-            "user dir; later runs at that config get the fast SEA trigger."
+            "SEA scheduling dial. -1 = SEA off (plain growing-window schedule; "
+            "accelerates from the first run, no calibration). 0 = SEA auto (match "
+            "the window schedule's refresh fraction at this step count — same "
+            "speed, smarter step placement). >0 = explicit refresh ratio (lower = "
+            "faster, less faithful). The first run at each (resolution / steps / "
+            "cfg / refresh_ratio) does a one-time full-compute calibration pass, "
+            "then caches δ to the ComfyUI user dir for later runs."
         ),
     },
 )
 
 
-class SpectrumSEAKSamplerModGuidance:
-    """Spectrum SEA sampler with modulation guidance.
+def _schedule_for(refresh_ratio):
+    """Map the refresh_ratio dial onto (schedule, refresh_ratio) for spectrum_sample."""
+    if refresh_ratio < 0.0:
+        return "window", -1.0
+    return "sea", refresh_ratio
 
-    Same forecasting + mod-guidance as the Spectrum mod-guidance node, but the
-    *when-to-skip* decision uses the Spectral-Evolution-Aware (SEA) metric
-    (SeaCache) instead of the content-blind growing window: it refreshes when the
-    accumulated SEA-filtered latent distance crosses an auto-calibrated δ, so
-    compute lands on the steps that actually move content. δ generalizes across
-    mod-guidance (validated), so calibration runs with mod active and stays valid.
+
+# ---------------------------------------------------------------------------
+# Nodes
+# ---------------------------------------------------------------------------
+
+
+class SpectrumKSampler:
+    """Unified Spectrum sampler — acceleration + SEA scheduling + mod guidance.
+
+    The one-stop drop-in. Chebyshev feature forecasting for ~2-3x speedup, the
+    Spectral-Evolution-Aware (SEA) skip decision (``refresh_ratio`` dial; -1
+    turns SEA off for the plain growing window), optional per-block modulation
+    guidance toward quality tags (``mod_w_profile``; 'off' = no steering), and
+    α-adaptive SMC-CFG for detail recovery. Subsumes the former
+    SpectrumKSampler / SpectrumKSamplerModGuidance / SpectrumSEAKSamplerModGuidance
+    nodes. DCW + full forecasting knobs live on the Advanced node.
     """
 
     @classmethod
@@ -637,29 +655,33 @@ class SpectrumSEAKSamplerModGuidance:
         return {
             "required": {
                 **_KSAMPLER_INPUTS,
-                **_MOD_GUIDANCE_SIMPLE_INPUTS,
-                "refresh_ratio": _SEA_REFRESH_RATIO_INPUT,
+                **_MOD_PROFILE_INPUTS,
+                "refresh_ratio": _REFRESH_RATIO_INPUT,
                 "adaptive_smc_alpha": _SMC_CFG_ALPHA_INPUT,
-            }
+            },
+            "optional": {
+                **_CLIP_INPUT,
+            },
         }
 
     RETURN_TYPES = ("LATENT",)
     FUNCTION = "sample"
     CATEGORY = "sampling"
     DESCRIPTION = (
-        "Spectrum-accelerated sampler with SEA cache scheduling + modulation "
-        "guidance. The SEA decision metric (SeaCache) refreshes on content "
-        "evolution rather than a fixed window, with δ auto-calibrated to the "
-        "refresh_ratio on first use and cached per config. Mod guidance steers "
-        "toward quality tags via the learned pooled-text projection (auto-"
-        "downloaded). Optional α-adaptive SMC-CFG for detail recovery. "
-        "Set mod_w_profile='off' to skip mod guidance."
+        "Spectrum-accelerated sampler (drop-in KSampler replacement). Skips "
+        "transformer blocks on predicted steps via Chebyshev feature "
+        "forecasting for ~2-3x speedup. By default the SEA decision metric "
+        "picks which steps to skip (refresh_ratio=0 → compute-matched to the "
+        "growing window, just smarter; -1 → plain window, accelerates from run "
+        "1). Optional modulation guidance steers toward quality tags via a "
+        "learned pooled-text projection (wire a CLIP; the ~12MB adapter "
+        "auto-downloads; set mod_w_profile='off' to skip). α-adaptive SMC-CFG "
+        "recovers detail. DCW + full Spectrum tuning live on the Advanced node."
     )
 
     def sample(
         self,
         model,
-        clip,
         seed,
         steps,
         cfg,
@@ -671,29 +693,22 @@ class SpectrumSEAKSamplerModGuidance:
         quality_tags,
         mod_w_profile,
         refresh_ratio,
+        quality_neg="",
+        clip=None,
         denoise=1.0,
         adaptive_smc_alpha=_SMC_CFG_ALPHA_DEFAULT,
     ):
-        if mod_w_profile == MOD_W_PROFILE_OFF:
-            m = model
-        else:
-            profile = MOD_W_PROFILES.get(mod_w_profile) or MOD_W_PROFILES[DEFAULT_MOD_W_PROFILE]
-            m = model.clone()
-            setup_mod_guidance(
-                m,
-                clip,
-                positive,
-                negative,
-                None,
-                quality_tags,
-                profile["w"],
-                start_layer=profile["start_layer"],
-                end_layer=profile["end_layer"],
-                taper=profile["taper"],
-                taper_scale=profile["taper_scale"],
-                final_w=profile["final_w"],
-            )
-        return spectrum_sample(
+        m = _apply_mod_profile(
+            model,
+            clip,
+            positive,
+            negative,
+            quality_tags,
+            mod_w_profile,
+            quality_neg=quality_neg,
+        )
+        schedule, refresh_ratio = _schedule_for(refresh_ratio)
+        return _run_spectrum(
             m,
             seed,
             steps,
@@ -704,11 +719,8 @@ class SpectrumSEAKSamplerModGuidance:
             negative,
             latent_image,
             denoise,
-            **_SPECTRUM_DEFAULTS,
-            dcw_mode="off",
-            smc_cfg_alpha=adaptive_smc_alpha,
-            smc_cfg_lambda=_SMC_CFG_LAMBDA_DEFAULT,
-            schedule="sea",
+            smc_alpha=adaptive_smc_alpha,
+            schedule=schedule,
             refresh_ratio=refresh_ratio,
         )
 
@@ -756,6 +768,7 @@ class SpectrumKSamplerAdvanced:
         adapter,
         quality_tags,
         mod_w,
+        quality_neg="",
         mod_start_layer=8,
         mod_end_layer=27,
         mod_taper=0,
@@ -764,7 +777,7 @@ class SpectrumKSamplerAdvanced:
         denoise=1.0,
         window_size=2.0,
         flex_window=0.25,
-        warmup_steps=7,
+        warmup_steps=6,
         blend_w=0.3,
         cheby_degree=3,
         ridge_lambda=0.1,
@@ -775,15 +788,15 @@ class SpectrumKSamplerAdvanced:
         adaptive_smc_alpha=_SMC_CFG_ALPHA_DEFAULT,
         smc_cfg_lambda=_SMC_CFG_LAMBDA_DEFAULT,
     ):
-        m = model.clone()
-        setup_mod_guidance(
-            m,
+        m = _apply_mod_guidance(
+            model,
             clip,
             positive,
             negative,
             adapter,
             quality_tags,
-            mod_w,
+            quality_neg=quality_neg,
+            w=mod_w,
             start_layer=mod_start_layer,
             end_layer=mod_end_layer,
             taper=mod_taper,
@@ -832,7 +845,8 @@ class AnimaModGuidance:
         return {
             "required": {
                 "model": ("MODEL", {"tooltip": "Model to patch with mod guidance."}),
-                **_MOD_GUIDANCE_SIMPLE_INPUTS,
+                **_CLIP_INPUT,
+                **_MOD_PROFILE_INPUTS,
                 "positive": ("CONDITIONING",),
                 "negative": ("CONDITIONING",),
             }
@@ -850,24 +864,24 @@ class AnimaModGuidance:
         "pass the model through unchanged."
     )
 
-    def patch(self, model, clip, quality_tags, mod_w_profile, positive, negative):
-        if mod_w_profile == MOD_W_PROFILE_OFF:
-            return (model,)
-        profile = MOD_W_PROFILES.get(mod_w_profile) or MOD_W_PROFILES[DEFAULT_MOD_W_PROFILE]
-        m = model.clone()
-        setup_mod_guidance(
-            m,
+    def patch(
+        self,
+        model,
+        clip,
+        quality_tags,
+        quality_neg,
+        mod_w_profile,
+        positive,
+        negative,
+    ):
+        m = _apply_mod_profile(
+            model,
             clip,
             positive,
             negative,
-            None,
             quality_tags,
-            profile["w"],
-            start_layer=profile["start_layer"],
-            end_layer=profile["end_layer"],
-            taper=profile["taper"],
-            taper_scale=profile["taper_scale"],
-            final_w=profile["final_w"],
+            mod_w_profile,
+            quality_neg=quality_neg,
         )
         return (m,)
 
@@ -1086,7 +1100,7 @@ class SpectrumSPDKSampler:
         denoise=1.0,
         adaptive_smc_alpha=_SMC_CFG_ALPHA_DEFAULT,
     ):
-        return spectrum_sample(
+        return _run_spectrum(
             model,
             seed,
             steps,
@@ -1097,10 +1111,7 @@ class SpectrumSPDKSampler:
             negative,
             latent_image,
             denoise,
-            **_SPECTRUM_DEFAULTS,
-            dcw_mode="off",
-            smc_cfg_alpha=adaptive_smc_alpha,
-            smc_cfg_lambda=_SMC_CFG_LAMBDA_DEFAULT,
+            smc_alpha=adaptive_smc_alpha,
             spd_scale=spd_scale,
             spd_sigma=spd_sigma,
         )
@@ -1203,15 +1214,20 @@ class SpectrumSPDLoRAKSampler:
             logger.warning(
                 "SPD LoRA '%s' has no ss_spd_stages metadata; falling back to the "
                 "validated %.2f / σ%.2f single handoff.",
-                lora_name, SPD_FALLBACK_SCALE, SPD_FALLBACK_SIGMA,
+                lora_name,
+                SPD_FALLBACK_SCALE,
+                SPD_FALLBACK_SIGMA,
             )
         else:
             logger.info(
                 "SPD LoRA '%s': auto schedule label=%s stages=%s σ=%s",
-                lora_name, label, spd_stages, spd_transition_sigmas,
+                lora_name,
+                label,
+                spd_stages,
+                spd_transition_sigmas,
             )
 
-        return spectrum_sample(
+        return _run_spectrum(
             m,
             seed,
             steps,
@@ -1222,10 +1238,7 @@ class SpectrumSPDLoRAKSampler:
             negative,
             latent_image,
             denoise,
-            **_SPECTRUM_DEFAULTS,
-            dcw_mode="off",
-            smc_cfg_alpha=adaptive_smc_alpha,
-            smc_cfg_lambda=_SMC_CFG_LAMBDA_DEFAULT,
+            smc_alpha=adaptive_smc_alpha,
             spd_scale=SPD_FALLBACK_SCALE,
             spd_sigma=SPD_FALLBACK_SIGMA,
             spd_stages=spd_stages,
@@ -1235,19 +1248,22 @@ class SpectrumSPDLoRAKSampler:
 
 NODE_CLASS_MAPPINGS = {
     "SpectrumKSampler": SpectrumKSampler,
-    "SpectrumKSamplerModGuidance": SpectrumKSamplerModGuidance,
-    "SpectrumSEAKSamplerModGuidance": SpectrumSEAKSamplerModGuidance,
     "SpectrumKSamplerAdvanced": SpectrumKSamplerAdvanced,
     "SpectrumSPDKSampler": SpectrumSPDKSampler,
     "SpectrumSPDLoRAKSampler": SpectrumSPDLoRAKSampler,
     "AnimaModGuidance": AnimaModGuidance,
     "DiTSpectrumPatch": DiTSpectrumPatch,
+    # Deprecated aliases — the mod-guidance + SEA samplers are now folded into
+    # the unified SpectrumKSampler (mod_w_profile + refresh_ratio dials). These
+    # keys are kept so saved workflows referencing them still load; they are
+    # intentionally absent from NODE_DISPLAY_NAME_MAPPINGS so they no longer
+    # appear in the add-node menu.
+    "SpectrumKSamplerModGuidance": SpectrumKSampler,
+    "SpectrumSEAKSamplerModGuidance": SpectrumKSampler,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "SpectrumKSampler": "KSampler (Spectrum)",
-    "SpectrumKSamplerModGuidance": "KSampler (Spectrum + Mod Guidance)",
-    "SpectrumSEAKSamplerModGuidance": "KSampler (Spectrum SEA + Mod Guidance)",
     "SpectrumKSamplerAdvanced": "KSampler (Spectrum + Mod Guidance Advanced)",
     "SpectrumSPDKSampler": "KSampler (Spectrum + SPD / SPEED)",
     "SpectrumSPDLoRAKSampler": "KSampler (SPD LoRA / auto-schedule)",
