@@ -107,6 +107,41 @@ EXPECTED_INPUTS = {
         "positive",
         "negative",
     },
+    "DiTSamplerContext": {
+        "steps",
+        "cfg",
+        "sampler_name",
+        "scheduler",
+        "denoise",
+        "base_ctx",
+    },
+    "DiTDCWPatch": {
+        "model",
+        "enabled",
+        "dcw_mode",
+        "dcw_lambda",
+        "dcw_band_mask",
+        "dcw_calibrator",
+        "clip",
+        "positive",
+    },
+    "DiTCFGFSGPatch": {
+        "model",
+        "sampling_ctx",
+        "enabled",
+        "smc_cfg",
+        "adaptive_smc_alpha",
+        "smc_cfg_lambda",
+        "cfgpp",
+        "cfgpp_lambda",
+        "fsg",
+        "fsg_band_lo",
+        "fsg_band_hi",
+        "fsg_k",
+        "fsg_d_sigma",
+        "fsg_gamma",
+        "replace_existing_cfg",
+    },
     "DiTSpectrumPatch": {
         "model",
         "steps",
@@ -147,14 +182,16 @@ def _load(locale):
 
 
 class LocaleNodeDefsTest(unittest.TestCase):
-    def test_locales_cover_displayed_nodes_tooltips_only(self):
+    def test_locales_cover_displayed_nodes_without_socket_renames(self):
         for locale in LOCALES:
             with self.subTest(locale=locale):
                 data = _load(locale)
                 self.assertEqual(set(data), set(EXPECTED_INPUTS))
                 for node_id, inputs in EXPECTED_INPUTS.items():
                     node = data[node_id]
-                    self.assertLessEqual(set(node), {"description", "inputs"})
+                    self.assertLessEqual(set(node), {"display_name", "description", "inputs"})
+                    self.assertIn("display_name", node)
+                    self.assertTrue(node["display_name"])
                     self.assertIn("description", node)
                     self.assertEqual(set(node["inputs"]), inputs)
                     for entry in node["inputs"].values():

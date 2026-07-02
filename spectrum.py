@@ -223,6 +223,10 @@ def _can_use_cached_prediction(
 ) -> bool:
     if state.mode != "cached" or not valid_chunks or not state.has_forecasters(keys):
         return False
+    if not _passes_cache_vetoes(
+        state, args, keys, input_x, timestep, c, model_options
+    ):
+        return False
     if state.compat_policy == "legacy":
         return True
     if not _wrapper_cache_safe(old_wrapper):
@@ -258,9 +262,7 @@ def _can_use_cached_prediction(
                 state.compat_policy,
             )
         return False
-    return _passes_cache_vetoes(
-        state, args, keys, input_x, timestep, c, model_options
-    )
+    return True
 
 
 def _update_forecasters_from_feature(

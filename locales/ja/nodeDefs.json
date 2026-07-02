@@ -1,5 +1,6 @@
 {
   "SpectrumKSampler": {
+    "display_name": "KSampler (Spectrum)",
     "description": "標準 KSampler の代替として使える Spectrum 加速 sampler です。Chebyshev feature forecasting、SEA skip scheduling、optional mod guidance、SMC-CFG を 1 つのノードで扱います。",
     "inputs": {
       "model": {
@@ -56,6 +57,7 @@
     }
   },
   "SpectrumKSamplerAdvanced": {
+    "display_name": "KSampler (Spectrum + Mod Guidance Advanced)",
     "description": "Spectrum 加速 sampler の advanced 版です。mod guidance、forecasting、DCW、FSG、SMC-CFG の詳細値を直接調整します。",
     "inputs": {
       "model": {
@@ -178,6 +180,7 @@
     }
   },
   "SpectrumSPDKSampler": {
+    "display_name": "KSampler (Spectrum + SPD / SPEED)",
     "description": "Spectrum と SPD/SPEED を組み合わせた sampler です。low-res prefix 後に full-res へ展開し、Spectrum が tail を予測します。",
     "inputs": {
       "model": {
@@ -225,6 +228,7 @@
     }
   },
   "SpectrumSPDLoRAKSampler": {
+    "display_name": "KSampler (SPD LoRA / auto-schedule)",
     "description": "SPD-trained LoRA を MODEL に適用し、adapter metadata から SPEED schedule を自動で読み取って sampling します。",
     "inputs": {
       "model": {
@@ -269,6 +273,7 @@
     }
   },
   "AnimaModGuidance": {
+    "display_name": "Anima Mod Guidance (model patch)",
     "description": "modulation guidance を standalone MODEL patcher として適用します。出力 MODEL は通常 sampler、Spectrum、SPEED の前に接続できます。",
     "inputs": {
       "model": {
@@ -294,7 +299,113 @@
       }
     }
   },
+  "DiTSamplerContext": {
+    "display_name": "DiT Sampler Context",
+    "description": "DiT model patcher が downstream sampler 設定を共有するための rgthree 互換 context を作成します。rgthree のインストールは不要です。",
+    "inputs": {
+      "steps": {
+        "tooltip": "downstream sampler の step 数です。"
+      },
+      "cfg": {
+        "tooltip": "downstream sampler の CFG scale です。"
+      },
+      "sampler_name": {
+        "tooltip": "downstream sampler 名です。"
+      },
+      "scheduler": {
+        "tooltip": "downstream scheduler 名です。"
+      },
+      "denoise": {
+        "tooltip": "downstream denoise 値です。"
+      },
+      "base_ctx": {
+        "tooltip": "拡張する既存の rgthree 互換 context です。sampler 設定キーはこのノードの値で上書きされます。"
+      }
+    }
+  },
+  "DiTDCWPatch": {
+    "display_name": "DiT DCW Patch",
+    "description": "DCW post-step SNR-t bias correction を MODEL patch として適用します。Anima 基準の flow-matching DiT 向けに調整されています。",
+    "inputs": {
+      "model": {
+        "tooltip": "DCW hook をインストールする DiT MODEL です。"
+      },
+      "enabled": {
+        "tooltip": "無効にすると入力 MODEL をそのまま通します。"
+      },
+      "dcw_mode": {
+        "tooltip": "DCW mode です。off/manual/auto から選びます。"
+      },
+      "dcw_lambda": {
+        "tooltip": "manual DCW strength です。auto mode では無視されます。"
+      },
+      "dcw_band_mask": {
+        "tooltip": "manual mode で correction を適用する Haar subband です。"
+      },
+      "dcw_calibrator": {
+        "tooltip": "auto mode で使う fusion-head safetensors です。"
+      },
+      "clip": {
+        "tooltip": "auto DCW calibrator setup に使う CLIP です。"
+      },
+      "positive": {
+        "tooltip": "auto DCW calibrator setup に使う positive conditioning です。"
+      }
+    }
+  },
+  "DiTCFGFSGPatch": {
+    "display_name": "DiT CFG-FSG Patch",
+    "description": "SMC-CFG、CFG++、FSG など CFG combine または sigma schedule に依存する DiT correction を 1 つの MODEL patch として適用します。",
+    "inputs": {
+      "model": {
+        "tooltip": "CFG/FSG correction をインストールする DiT MODEL です。"
+      },
+      "sampling_ctx": {
+        "tooltip": "DiT Sampler Context または rgthree 互換 context です。downstream sampler と同じ値にしてください。"
+      },
+      "enabled": {
+        "tooltip": "無効にすると入力 MODEL をそのまま通します。"
+      },
+      "smc_cfg": {
+        "tooltip": "alpha-adaptive SMC-CFG を有効化します。CFG++ とは同時に使えません。"
+      },
+      "adaptive_smc_alpha": {
+        "tooltip": "SMC-CFG alpha gain です。0 なら SMC-CFG は無効です。"
+      },
+      "smc_cfg_lambda": {
+        "tooltip": "SMC-CFG sliding manifold lambda です。"
+      },
+      "cfgpp": {
+        "tooltip": "CFG++ sigma-scheduled CFG combine を有効化します。SMC-CFG とは同時に使えません。"
+      },
+      "cfgpp_lambda": {
+        "tooltip": "CFG++ substrate lambda です。cfgpp が有効なときに使います。"
+      },
+      "fsg": {
+        "tooltip": "FSG fixed-point latent calibration を有効化します。CFG が 1 でない場合のみ動作します。"
+      },
+      "fsg_band_lo": {
+        "tooltip": "FSG が動作する sigma band の下限です。"
+      },
+      "fsg_band_hi": {
+        "tooltip": "FSG が動作する sigma band の上限です。"
+      },
+      "fsg_k": {
+        "tooltip": "FSG fixed-point iteration 数です。0 なら無効です。"
+      },
+      "fsg_d_sigma": {
+        "tooltip": "FSG forward-backward stride delta sigma です。"
+      },
+      "fsg_gamma": {
+        "tooltip": "FSG calibration guidance gamma です。0 なら context の CFG scale を使います。"
+      },
+      "replace_existing_cfg": {
+        "tooltip": "既存の sampler_cfg_function を上書きするかどうかです。意図した場合のみ有効にしてください。"
+      }
+    }
+  },
   "DiTSpectrumPatch": {
+    "display_name": "DiT Spectrum Patch",
     "description": "standalone DiT Spectrum MODEL patcher です。通常 KSampler や Custom Sampler の前に接続し、final_layer 前の feature forecasting だけを適用します。",
     "inputs": {
       "model": {
@@ -339,6 +450,7 @@
     }
   },
   "DiTSpectrumPatchAdvanced": {
+    "display_name": "DiT Spectrum Patch Advanced",
     "description": "互換性制御を備えた standalone DiT Spectrum MODEL patcher です。不確実な cached prediction を actual DiT forward に戻せます。",
     "inputs": {
       "model": {

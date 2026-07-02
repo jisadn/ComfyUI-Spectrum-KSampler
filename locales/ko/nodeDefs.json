@@ -1,5 +1,6 @@
 {
   "SpectrumKSampler": {
+    "display_name": "KSampler (Spectrum)",
     "description": "기본 KSampler를 대체하는 Spectrum 가속 sampler입니다. Chebyshev feature forecasting, SEA skip scheduling, optional mod guidance, SMC-CFG를 한 노드에서 사용합니다.",
     "inputs": {
       "model": {
@@ -56,6 +57,7 @@
     }
   },
   "SpectrumKSamplerAdvanced": {
+    "display_name": "KSampler (Spectrum + Mod Guidance 고급)",
     "description": "Spectrum 가속 sampler의 advanced 버전입니다. mod guidance, forecasting, DCW, FSG, SMC-CFG 세부 값을 직접 조정합니다.",
     "inputs": {
       "model": {
@@ -178,6 +180,7 @@
     }
   },
   "SpectrumSPDKSampler": {
+    "display_name": "KSampler (Spectrum + SPD / SPEED)",
     "description": "Spectrum과 SPD/SPEED를 결합한 sampler입니다. low-res prefix 이후 full-res로 확장하고 Spectrum이 tail을 예측합니다.",
     "inputs": {
       "model": {
@@ -225,6 +228,7 @@
     }
   },
   "SpectrumSPDLoRAKSampler": {
+    "display_name": "KSampler (SPD LoRA / 자동 스케줄)",
     "description": "SPD-trained LoRA를 MODEL에 적용하고 adapter metadata에서 SPEED schedule을 자동으로 읽어 sampling합니다.",
     "inputs": {
       "model": {
@@ -269,6 +273,7 @@
     }
   },
   "AnimaModGuidance": {
+    "display_name": "Anima Mod Guidance (모델 패치)",
     "description": "modulation guidance를 standalone MODEL patcher로 적용합니다. 출력 MODEL은 일반 sampler, Spectrum, SPEED 앞에 연결할 수 있습니다.",
     "inputs": {
       "model": {
@@ -294,7 +299,113 @@
       }
     }
   },
+  "DiTSamplerContext": {
+    "display_name": "DiT 샘플러 컨텍스트",
+    "description": "DiT 모델 패처가 downstream sampler 설정을 공유하도록 rgthree 호환 컨텍스트를 만듭니다. rgthree 설치는 필요하지 않습니다.",
+    "inputs": {
+      "steps": {
+        "tooltip": "downstream sampler의 step 수입니다."
+      },
+      "cfg": {
+        "tooltip": "downstream sampler의 CFG scale입니다."
+      },
+      "sampler_name": {
+        "tooltip": "downstream sampler 이름입니다."
+      },
+      "scheduler": {
+        "tooltip": "downstream scheduler 이름입니다."
+      },
+      "denoise": {
+        "tooltip": "downstream denoise 값입니다."
+      },
+      "base_ctx": {
+        "tooltip": "확장할 기존 rgthree 호환 context입니다. sampler 설정 키는 이 노드 값으로 덮어씁니다."
+      }
+    }
+  },
+  "DiTDCWPatch": {
+    "display_name": "DiT DCW 패치",
+    "description": "DCW post-step SNR-t bias correction을 MODEL 패치로 적용합니다. Anima 기준 flow-matching DiT에 맞춰 튜닝되었습니다.",
+    "inputs": {
+      "model": {
+        "tooltip": "DCW hook을 설치할 DiT MODEL입니다."
+      },
+      "enabled": {
+        "tooltip": "끄면 입력 MODEL을 그대로 통과시킵니다."
+      },
+      "dcw_mode": {
+        "tooltip": "DCW 모드입니다. off/manual/auto 중 선택합니다."
+      },
+      "dcw_lambda": {
+        "tooltip": "manual DCW 강도입니다. auto 모드에서는 무시됩니다."
+      },
+      "dcw_band_mask": {
+        "tooltip": "manual 모드에서 correction을 적용할 Haar subband입니다."
+      },
+      "dcw_calibrator": {
+        "tooltip": "auto 모드에서 사용할 fusion-head safetensors입니다."
+      },
+      "clip": {
+        "tooltip": "auto DCW calibrator setup에 사용할 CLIP입니다."
+      },
+      "positive": {
+        "tooltip": "auto DCW calibrator setup에 사용할 positive conditioning입니다."
+      }
+    }
+  },
+  "DiTCFGFSGPatch": {
+    "display_name": "DiT CFG-FSG 패치",
+    "description": "SMC-CFG, CFG++, FSG처럼 CFG combine 또는 sigma schedule에 의존하는 DiT correction을 하나의 MODEL 패치로 적용합니다.",
+    "inputs": {
+      "model": {
+        "tooltip": "CFG/FSG correction을 설치할 DiT MODEL입니다."
+      },
+      "sampling_ctx": {
+        "tooltip": "DiT Sampler Context 또는 rgthree 호환 context입니다. downstream sampler와 값이 같아야 합니다."
+      },
+      "enabled": {
+        "tooltip": "끄면 입력 MODEL을 그대로 통과시킵니다."
+      },
+      "smc_cfg": {
+        "tooltip": "alpha-adaptive SMC-CFG를 켭니다. CFG++와 동시에 사용할 수 없습니다."
+      },
+      "adaptive_smc_alpha": {
+        "tooltip": "SMC-CFG alpha gain입니다. 0이면 SMC-CFG가 비활성화됩니다."
+      },
+      "smc_cfg_lambda": {
+        "tooltip": "SMC-CFG sliding manifold lambda입니다."
+      },
+      "cfgpp": {
+        "tooltip": "CFG++ sigma-scheduled CFG combine을 켭니다. SMC-CFG와 동시에 사용할 수 없습니다."
+      },
+      "cfgpp_lambda": {
+        "tooltip": "CFG++ substrate lambda입니다. cfgpp가 켜졌을 때 사용합니다."
+      },
+      "fsg": {
+        "tooltip": "FSG fixed-point latent calibration을 켭니다. CFG 1이 아닌 경우에만 동작합니다."
+      },
+      "fsg_band_lo": {
+        "tooltip": "FSG가 동작할 sigma band 하한입니다."
+      },
+      "fsg_band_hi": {
+        "tooltip": "FSG가 동작할 sigma band 상한입니다."
+      },
+      "fsg_k": {
+        "tooltip": "FSG fixed-point 반복 횟수입니다. 0이면 비활성입니다."
+      },
+      "fsg_d_sigma": {
+        "tooltip": "FSG forward-backward stride delta sigma입니다."
+      },
+      "fsg_gamma": {
+        "tooltip": "FSG calibration guidance gamma입니다. 0이면 context의 CFG scale을 사용합니다."
+      },
+      "replace_existing_cfg": {
+        "tooltip": "기존 sampler_cfg_function을 덮어쓸지 여부입니다. 의도한 경우에만 켭니다."
+      }
+    }
+  },
   "DiTSpectrumPatch": {
+    "display_name": "DiT Spectrum 패치",
     "description": "standalone DiT Spectrum MODEL patcher입니다. 일반 KSampler나 Custom Sampler 앞에 연결해서 final_layer 이전 feature forecasting만 적용합니다.",
     "inputs": {
       "model": {
@@ -339,6 +450,7 @@
     }
   },
   "DiTSpectrumPatchAdvanced": {
+    "display_name": "DiT Spectrum 패치 고급",
     "description": "호환성 제어가 포함된 standalone DiT Spectrum MODEL patcher입니다. 불확실한 cached prediction을 actual DiT forward로 되돌릴 수 있습니다.",
     "inputs": {
       "model": {

@@ -1,14 +1,20 @@
 """ComfyUI node definitions for Spectrum inference acceleration."""
 
+import copy
 import json
 import logging
+import math
 
 import comfy.samplers
 import comfy.sd
 import comfy.utils
 import folder_paths
 
+from .dcw import install_dcw
+from .dcw_calibrator import setup_dcw_calibrator
+from .fsg import FSGCalibrator, fsg_step_indices, install_cfgpp, install_fsg
 from .mod_guidance import AUTO_ADAPTER_SENTINEL, setup_mod_guidance
+from .smc_cfg import install_smc_cfg
 from .spectrum import COMPAT_POLICIES, apply_dit_spectrum_patch, spectrum_sample
 
 logger = logging.getLogger(__name__)
@@ -617,6 +623,120 @@ _FSG_INPUTS = {
 # ---------------------------------------------------------------------------
 
 
+def _clone_model_options(model):
+    """Copy model_options so model patch nodes do not mutate the input MODEL."""
+    try:
+        model.model_options = copy.deepcopy(model.model_options)
+    except Exception as e:
+        logger.warning(
+            "DiT model patch: deepcopy(model_options) failed (%s); using a shallow copy.",
+            e,
+        )
+        model.model_options = dict(model.model_options)
+
+
+def _new_sampler_context(
+    base_ctx=None,
+    *,
+    steps,
+    cfg,
+    sampler_name,
+    scheduler,
+    denoise,
+):
+    """Create an rgthree-compatible context carrying sampler settings."""
+    ctx = dict(base_ctx) if isinstance(base_ctx, dict) else {}
+    ctx["steps"] = int(steps)
+    ctx["cfg"] = float(cfg)
+    # rgthree's standard key is "sampler"; keep sampler_name too for clarity.
+    ctx["sampler"] = str(sampler_name)
+    ctx["sampler_name"] = str(sampler_name)
+    ctx["scheduler"] = str(scheduler)
+    ctx["denoise"] = float(denoise)
+    return ctx
+
+
+def _context_value(ctx, *keys, default=None):
+    if not isinstance(ctx, dict):
+        return default
+    for key in keys:
+        value = ctx.get(key)
+        if value is not None:
+            return value
+    return default
+
+
+def _sampler_settings_from_context(ctx):
+    """Read downstream sampler settings from an rgthree-compatible context."""
+    if not isinstance(ctx, dict):
+        raise RuntimeError(
+            "DiT CFG-FSG Patch requires a RGTHREE_CONTEXT dict. Use DiT Sampler "
+            "Context, rgthree Context, or another compatible context node."
+        )
+    missing = [
+        name
+        for name, keys in {
+            "steps": ("steps",),
+            "cfg": ("cfg",),
+            "sampler": ("sampler", "sampler_name"),
+            "scheduler": ("scheduler",),
+        }.items()
+        if _context_value(ctx, *keys) is None
+    ]
+    if missing:
+        raise RuntimeError(
+            "DiT CFG-FSG Patch sampler context is missing: "
+            + ", ".join(missing)
+            + ". Use DiT Sampler Context or an rgthree context carrying these keys."
+        )
+    return (
+        int(_context_value(ctx, "steps")),
+        float(_context_value(ctx, "cfg")),
+        str(_context_value(ctx, "sampler", "sampler_name")),
+        str(_context_value(ctx, "scheduler")),
+        float(_context_value(ctx, "denoise", default=1.0)),
+    )
+
+
+def _sampler_cfg_function_exists(model):
+    return model.model_options.get("sampler_cfg_function") is not None
+
+
+def _require_sampler_cfg_slot(model, feature_name, replace_existing_cfg):
+    if not _sampler_cfg_function_exists(model) or replace_existing_cfg:
+        return
+    raise RuntimeError(
+        f"{feature_name} needs sampler_cfg_function, but this MODEL already has "
+        "one. Disable the existing CFG patch or set replace_existing_cfg=true."
+    )
+
+
+def _add_spectrum_cache_veto(model, veto):
+    """Register a cache-veto callback consumed by DiT Spectrum Patch Advanced."""
+    existing = model.model_options.get("spectrum_cache_vetoes")
+    if existing is None:
+        vetoes = []
+    elif callable(existing):
+        vetoes = [existing]
+    else:
+        try:
+            vetoes = list(existing)
+        except TypeError:
+            vetoes = []
+    vetoes.append(veto)
+    model.model_options["spectrum_cache_vetoes"] = vetoes
+
+
+def _fsg_spectrum_cache_veto(fsg_steps):
+    fsg_steps = frozenset(fsg_steps)
+
+    def veto(state, **_kwargs):
+        return getattr(state, "step_idx", -1) not in fsg_steps
+
+    veto.__name__ = "dit_cfg_fsg_spectrum_cache_veto"
+    return veto
+
+
 def _apply_mod_guidance(
     model,
     clip,
@@ -1057,6 +1177,343 @@ class AnimaModGuidance:
         return (m,)
 
 
+class DiTSamplerContext:
+    """rgthree-compatible sampler-settings context for DiT model patches."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "steps": (
+                    "INT",
+                    {
+                        "default": 30,
+                        "min": 1,
+                        "max": 10000,
+                        "tooltip": "Downstream sampler step count.",
+                    },
+                ),
+                "cfg": (
+                    "FLOAT",
+                    {
+                        "default": 4.0,
+                        "min": 0.0,
+                        "max": 100.0,
+                        "step": 0.1,
+                        "round": 0.01,
+                        "tooltip": "Downstream sampler CFG scale.",
+                    },
+                ),
+                "sampler_name": (
+                    comfy.samplers.KSampler.SAMPLERS,
+                    {"tooltip": "Downstream sampler name."},
+                ),
+                "scheduler": (
+                    comfy.samplers.KSampler.SCHEDULERS,
+                    {"tooltip": "Downstream scheduler name."},
+                ),
+                "denoise": (
+                    "FLOAT",
+                    {
+                        "default": 1.0,
+                        "min": 0.0,
+                        "max": 1.0,
+                        "step": 0.01,
+                        "tooltip": "Downstream denoise value.",
+                    },
+                ),
+            },
+            "optional": {
+                "base_ctx": (
+                    "RGTHREE_CONTEXT",
+                    {
+                        "tooltip": (
+                            "Optional rgthree-compatible context to extend. Existing "
+                            "keys are preserved except sampler settings overwritten here."
+                        ),
+                    },
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("RGTHREE_CONTEXT",)
+    RETURN_NAMES = ("sampling_ctx",)
+    FUNCTION = "build"
+    CATEGORY = "sampling"
+    DESCRIPTION = (
+        "Builds an rgthree-compatible context carrying sampler settings for DiT "
+        "model patch nodes. This node does not require rgthree; it only uses the "
+        "same RGTHREE_CONTEXT type and dict keys."
+    )
+    OUTPUT_TOOLTIPS = (
+        "Context dict containing steps, cfg, sampler, scheduler, and denoise.",
+    )
+
+    def build(self, steps, cfg, sampler_name, scheduler, denoise=1.0, base_ctx=None):
+        return (
+            _new_sampler_context(
+                base_ctx,
+                steps=steps,
+                cfg=cfg,
+                sampler_name=sampler_name,
+                scheduler=scheduler,
+                denoise=denoise,
+            ),
+        )
+
+
+class DiTDCWPatch:
+    """Standalone DCW MODEL patcher for Anima-tuned flow-matching DiTs."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL", {"tooltip": "DiT MODEL to patch with DCW."}),
+                "enabled": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "Disable to pass the input MODEL through unchanged.",
+                    },
+                ),
+                **_DCW_INPUTS,
+            },
+            "optional": {
+                **_CLIP_INPUT,
+                "positive": (
+                    "CONDITIONING",
+                    {
+                        "tooltip": (
+                            "Positive conditioning used only by dcw_mode=auto to "
+                            "setup the DCW calibrator."
+                        ),
+                    },
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "patch"
+    CATEGORY = "model_patches"
+    DESCRIPTION = (
+        "Standalone DiT DCW model patch. Adds post-step SNR-t bias correction "
+        "through ComfyUI sampler hooks. Tuned for Anima flow-matching DiTs; "
+        "other DiTs are not guaranteed."
+    )
+    OUTPUT_TOOLTIPS = (
+        "MODEL clone patched with DCW hooks, or the input MODEL when disabled.",
+    )
+
+    def patch(
+        self,
+        model,
+        enabled=True,
+        dcw_mode="off",
+        dcw_lambda=0.01,
+        dcw_band_mask="LL",
+        dcw_calibrator=AUTO_CALIBRATOR_SENTINEL,
+        clip=None,
+        positive=None,
+    ):
+        if not enabled or dcw_mode == "off":
+            return (model,)
+
+        m = model.clone()
+        _clone_model_options(m)
+
+        calibrator = None
+        if dcw_mode == "auto":
+            if positive is None or clip is None:
+                logger.warning(
+                    "DiT DCW Patch: dcw_mode=auto but clip/positive is missing; "
+                    "falling back to manual DCW."
+                )
+            else:
+                calibrator = setup_dcw_calibrator(m, clip, positive, dcw_calibrator)
+
+        install_dcw(
+            m,
+            lam=dcw_lambda,
+            schedule="one_minus_sigma",
+            band_mask=dcw_band_mask,
+            calibrator=calibrator,
+        )
+        return (m,)
+
+
+class DiTCFGFSGPatch:
+    """Standalone CFG-space correction patcher for DiT samplers."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": (
+                    "MODEL",
+                    {"tooltip": "DiT MODEL to patch with CFG/FSG corrections."},
+                ),
+                "sampling_ctx": (
+                    "RGTHREE_CONTEXT",
+                    {
+                        "tooltip": (
+                            "Sampler settings context from DiT Sampler Context or "
+                            "a compatible rgthree context. Must match the downstream sampler."
+                        ),
+                    },
+                ),
+                "enabled": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "Disable to pass the input MODEL through unchanged.",
+                    },
+                ),
+                "smc_cfg": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": (
+                            "Enable α-adaptive SMC-CFG. Mutually exclusive with "
+                            "CFG++ because both replace sampler_cfg_function."
+                        ),
+                    },
+                ),
+                "adaptive_smc_alpha": _SMC_CFG_ALPHA_INPUT,
+                "smc_cfg_lambda": _SMC_CFG_LAMBDA_INPUT,
+                "cfgpp": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": (
+                            "Enable CFG++ σ-scheduled CFG combine. Mutually "
+                            "exclusive with SMC-CFG."
+                        ),
+                    },
+                ),
+                **_FSG_INPUTS,
+                "replace_existing_cfg": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": (
+                            "Allow this node to overwrite an existing sampler_cfg_function. "
+                            "Leave false unless you intentionally want this patch to win."
+                        ),
+                    },
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "patch"
+    CATEGORY = "model_patches"
+    DESCRIPTION = (
+        "Standalone DiT CFG/FSG model patch. Groups corrections that depend on "
+        "CFG combine or sampler σ schedule: SMC-CFG, CFG++, and FSG. The sampler "
+        "settings come from an rgthree-compatible context so this node keeps a "
+        "single context input instead of separate steps/cfg/sampler/scheduler/denoise sockets."
+    )
+    OUTPUT_TOOLTIPS = (
+        "MODEL clone patched with the selected CFG/FSG hooks, or the input MODEL when disabled.",
+    )
+
+    def patch(
+        self,
+        model,
+        sampling_ctx,
+        enabled=True,
+        smc_cfg=False,
+        adaptive_smc_alpha=_SMC_CFG_ALPHA_DEFAULT,
+        smc_cfg_lambda=_SMC_CFG_LAMBDA_DEFAULT,
+        cfgpp=False,
+        cfgpp_lambda=0.0,
+        fsg=False,
+        fsg_band_lo=0.59,
+        fsg_band_hi=0.75,
+        fsg_k=3,
+        fsg_d_sigma=0.1,
+        fsg_gamma=0.0,
+        replace_existing_cfg=False,
+    ):
+        if not enabled:
+            return (model,)
+
+        steps, cfg, sampler_name, scheduler, denoise = _sampler_settings_from_context(
+            sampling_ctx
+        )
+        do_cfg = not math.isclose(float(cfg), 1.0)
+        want_smc = bool(smc_cfg) and float(adaptive_smc_alpha) > 0.0
+        want_cfgpp = bool(cfgpp) and float(cfgpp_lambda) > 0.0
+        want_fsg = bool(fsg) and int(fsg_k) > 0
+
+        if not (want_smc or want_cfgpp or want_fsg):
+            return (model,)
+        if not do_cfg:
+            logger.warning("DiT CFG-FSG Patch: CFG corrections need cfg != 1.0; ignoring.")
+            return (model,)
+        if want_smc and want_cfgpp:
+            raise RuntimeError(
+                "DiT CFG-FSG Patch: SMC-CFG and CFG++ both replace "
+                "sampler_cfg_function. Disable one of them."
+            )
+        if want_smc and want_fsg:
+            raise RuntimeError(
+                "DiT CFG-FSG Patch: FSG is validated on CFG++/plain CFG, not on "
+                "SMC-CFG. Disable either smc_cfg or fsg."
+            )
+        if want_fsg and not want_cfgpp:
+            logger.warning(
+                "DiT CFG-FSG Patch: FSG is enabled without CFG++; this is an "
+                "experimental plain-CFG substrate."
+            )
+
+        m = model.clone()
+        _clone_model_options(m)
+
+        if want_smc:
+            _require_sampler_cfg_slot(m, "SMC-CFG", replace_existing_cfg)
+            install_smc_cfg(
+                m,
+                alpha=float(adaptive_smc_alpha),
+                lam=float(smc_cfg_lambda),
+            )
+
+        sigma_schedule = None
+        if want_cfgpp or want_fsg:
+            ks_sched = comfy.samplers.KSampler(
+                m,
+                steps=steps,
+                device=m.load_device,
+                sampler=sampler_name,
+                scheduler=scheduler,
+                denoise=denoise,
+            )
+            sigma_schedule = [float(s) for s in ks_sched.sigmas]
+
+        if want_cfgpp:
+            _require_sampler_cfg_slot(m, "CFG++", replace_existing_cfg)
+            install_cfgpp(m, lam=float(cfgpp_lambda), sigmas=sigma_schedule)
+
+        if want_fsg:
+            fsg_obj = FSGCalibrator(
+                band=(float(fsg_band_lo), float(fsg_band_hi)),
+                k=int(fsg_k),
+                d_sigma=float(fsg_d_sigma),
+                gamma=(float(fsg_gamma) if fsg_gamma and fsg_gamma > 0.0 else None),
+            )
+            fsg_steps = fsg_step_indices(fsg_obj, sigma_schedule, steps)
+            install_fsg(m, fsg=fsg_obj, guidance_scale=float(cfg))
+            _add_spectrum_cache_veto(m, _fsg_spectrum_cache_veto(fsg_steps))
+            logger.info(
+                "DiT CFG-FSG Patch: FSG active on %d in-band steps; Spectrum "
+                "cached prediction is vetoed for those steps.",
+                len(fsg_steps),
+            )
+
+        return (m,)
+
+
 class DiTSpectrumPatch:
     """Standalone DiT Spectrum MODEL patcher.
 
@@ -1476,6 +1933,9 @@ NODE_CLASS_MAPPINGS = {
     "SpectrumSPDKSampler": SpectrumSPDKSampler,
     "SpectrumSPDLoRAKSampler": SpectrumSPDLoRAKSampler,
     "AnimaModGuidance": AnimaModGuidance,
+    "DiTSamplerContext": DiTSamplerContext,
+    "DiTDCWPatch": DiTDCWPatch,
+    "DiTCFGFSGPatch": DiTCFGFSGPatch,
     "DiTSpectrumPatch": DiTSpectrumPatch,
     "DiTSpectrumPatchAdvanced": DiTSpectrumPatchAdvanced,
     # Deprecated aliases — the mod-guidance + SEA samplers are now folded into
@@ -1493,6 +1953,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SpectrumSPDKSampler": "KSampler (Spectrum + SPD / SPEED)",
     "SpectrumSPDLoRAKSampler": "KSampler (SPD LoRA / auto-schedule)",
     "AnimaModGuidance": "Anima Mod Guidance (model patch)",
+    "DiTSamplerContext": "DiT Sampler Context",
+    "DiTDCWPatch": "DiT DCW Patch",
+    "DiTCFGFSGPatch": "DiT CFG-FSG Patch",
     "DiTSpectrumPatch": "DiT Spectrum Patch",
     "DiTSpectrumPatchAdvanced": "DiT Spectrum Patch Advanced",
 }
