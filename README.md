@@ -10,7 +10,7 @@ Tuned for the [Anima](https://github.com/sorryhyun/anima_lora) DiT — its modul
 - [Usage](#usage) — node placement, sampler compatibility
   - [Standalone MODEL patcher](#standalone-model-patcher) — wire Spectrum before stock samplers
   - [DiT Spectrum Patch Advanced](#dit-spectrum-patch-advanced) — safer cache policy for complex sampler flows
-  - [Context-based correction patchers](#context-based-correction-patchers) — DCW / SMC-CFG / CFG++ / FSG as MODEL patches
+  - [Standalone correction patchers](#standalone-correction-patchers) — DCW / SMC-CFG / CFG++ / FSG as MODEL patches
 - [Parameters](#parameters) — Spectrum knobs + tuning tips
 - [Modulation guidance](#modulation-guidance) — AdaLN-side quality steering via `pooled_text_proj`
 - [SMC-CFG (α-adaptive sliding-mode CFG)](#smc-cfg-α-adaptive-sliding-mode-cfg) — velocity-space CFG combine modification
@@ -103,38 +103,28 @@ Set the patcher's `steps` to the downstream sampler's `steps`, then start with `
 
 Why this matters: Spectrum forecasts DiT features from previous actual steps. In a simple prompt there is usually one positive branch and one negative branch. In exact artist mix, each artist is a separate positive conditioning branch. `strict` keeps those branch histories separate by requiring ComfyUI UUID keys before caching; without them, it avoids cached predictions rather than mixing unrelated artist trajectories.
 
-### Context-based correction patchers
+### Standalone correction patchers
 
 The extra correction features are also available as standalone `MODEL -> MODEL` patches. These patchers are tuned for Anima-style flow-matching DiTs. They may run on other DiT models that expose compatible ComfyUI sampler semantics, but quality and stability are not guaranteed there.
-
-Use **DiT Sampler Context** to collect sampler settings once:
-
-```
-DiT Sampler Context(steps, cfg, sampler_name, scheduler, denoise) -> sampling_ctx
-```
-
-The context is rgthree-compatible by type (`RGTHREE_CONTEXT`) and dict shape, but rgthree is not required. If rgthree is installed, an rgthree Context can also be connected as long as it carries `steps`, `cfg`, `sampler` or `sampler_name`, and `scheduler`; `denoise` falls back to `1.0` when missing. For non-1.0 denoise, use **DiT Sampler Context** so the patcher sees the exact value.
 
 Recommended model chain:
 
 ```
 MODEL
 -> Anima Mod Guidance / LoRA patches
--> DiT DCW Patch
--> DiT CFG-FSG Patch
+-> DiT CFG-FSG/DCW Patch
 -> DiT Spectrum Patch Advanced
 -> KSampler / KSampler Advanced / Custom Sampler
 ```
 
-**DiT DCW Patch** is separate because DCW does not own `sampler_cfg_function`; it installs post-step latent correction hooks. Use `dcw_mode = off/manual/auto` to control it. Auto mode optionally reads `clip` + `positive` to set up the DCW calibrator; if those are missing it falls back to manual behavior.
+**DiT CFG-FSG/DCW Patch** groups DCW and the CFG/sigma-schedule corrections in one MODEL patcher:
 
-**DiT CFG-FSG Patch** groups the features that depend on CFG combine or the downstream sigma schedule:
+- `dcw_mode` enables DCW post-step latent correction. `auto` requires the optional `clip` and `positive` inputs; if either is missing the node raises a clear error instead of silently falling back.
+- `smc_cfg` enables SMC-CFG and requires the optional `cfg` input.
+- `cfgpp` + `cfgpp_lambda` enables CFG++ and requires optional `steps`, `cfg`, `sampler_name`, `scheduler`, and `denoise`.
+- `fsg` enables FSG fixed-point latent calibration and requires the same optional sampler inputs as CFG++.
 
-- `smc_cfg` enables SMC-CFG.
-- `cfgpp` + `cfgpp_lambda` enables CFG++.
-- `fsg` enables FSG fixed-point latent calibration.
-
-SMC-CFG and CFG++ cannot both be enabled because both replace `sampler_cfg_function`. FSG is not allowed with SMC-CFG in this patcher; use FSG with CFG++ or, experimentally, plain CFG. When FSG is enabled, the patcher registers a Spectrum cache veto for FSG in-band steps. For that veto to work, place **DiT CFG-FSG Patch before DiT Spectrum Patch Advanced**.
+SMC-CFG and CFG++ cannot both be enabled because both replace `sampler_cfg_function`. FSG is not allowed with SMC-CFG in this patcher; use FSG with CFG++ or, experimentally, plain CFG. When FSG is enabled, the patcher registers a Spectrum cache veto for FSG in-band steps. For that veto to work, place **DiT CFG-FSG/DCW Patch before DiT Spectrum Patch Advanced**.
 
 ## Parameters
 
@@ -196,7 +186,7 @@ Per-block guidance schedules address quality drift on LoRAs whose distribution s
 
 ## SMC-CFG (α-adaptive sliding-mode CFG)
 
-Every sampler node exposes an `adaptive_smc_alpha` knob (default `0.2`, set `0` to disable) that swaps the standard CFG combine for an **α-adaptive sliding-mode controller** ([Wang et al., arXiv:2603.03281](https://arxiv.org/abs/2603.03281), Anima α-adaptive form). The Advanced node additionally exposes `smc_cfg_lambda`, and **DiT CFG-FSG Patch** exposes the same correction as a standalone MODEL patch. Auto-skipped when CFG = 1 (no cond/uncond residual to slide on).
+Every sampler node exposes an `adaptive_smc_alpha` knob (default `0.2`, set `0` to disable) that swaps the standard CFG combine for an **α-adaptive sliding-mode controller** ([Wang et al., arXiv:2603.03281](https://arxiv.org/abs/2603.03281), Anima α-adaptive form). The Advanced node additionally exposes `smc_cfg_lambda`, and **DiT CFG-FSG/DCW Patch** exposes the same correction as a standalone MODEL patch. Auto-skipped when CFG = 1 (no cond/uncond residual to slide on).
 
 At each denoising step, with `e_t = v_cond − v_uncond`:
 
@@ -223,7 +213,7 @@ SMC-CFG operates in **velocity space** — it must, because σ varies per step a
 
 ## DCW post-step bias correction
 
-DCW is exposed on the **Advanced** sampler node and on the standalone **DiT DCW Patch**. It defaults to **off** — turn it on per-workflow when you want the correction. The unified **KSampler (Spectrum)** node does not run DCW; switch to **KSampler (Spectrum + Mod Guidance Advanced)** or chain **DiT DCW Patch** before your sampler to access the full `dcw_mode` / `dcw_lambda` / `dcw_band_mask` / `dcw_calibrator` surface. `dcw_mode = auto` runs the OnlineDCWCalibrator fusion head (per-prompt λ̂, auto-downloaded on first use); `manual` uses the scalar `dcw_lambda × schedule(σ)`; `off` disables.
+DCW is exposed on the **Advanced** sampler node and on **DiT CFG-FSG/DCW Patch**. It defaults to **off** — turn it on per-workflow when you want the correction. The unified **KSampler (Spectrum)** node does not run DCW; switch to **KSampler (Spectrum + Mod Guidance Advanced)** or chain **DiT CFG-FSG/DCW Patch** before your sampler to access the full `dcw_mode` / `dcw_lambda` / `dcw_band_mask` / `dcw_calibrator` surface. `dcw_mode = auto` runs the OnlineDCWCalibrator fusion head (per-prompt λ̂, auto-downloaded on first use) and requires the patch node's optional `clip` + `positive` inputs; `manual` uses the scalar `dcw_lambda × schedule(σ)`; `off` disables.
 
 DCW ([Yu et al., CVPR 2026](https://arxiv.org/abs/2604.16044)) is a sampler-level post-step correction for the SNR-t bias of flow-matching DiTs. Each step's `prev_sample` is mixed toward (or away from) the post-CFG `x0_pred`, optionally restricted to a single-level Haar subband of the differential:
 

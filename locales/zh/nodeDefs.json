@@ -299,108 +299,84 @@
       }
     }
   },
-  "DiTSamplerContext": {
-    "display_name": "DiT Sampler Context",
-    "description": "建立 rgthree 相容 context，让 DiT model patcher 共享 downstream sampler 设置。不需要安装 rgthree。",
-    "inputs": {
-      "steps": {
-        "tooltip": "downstream sampler 的 step 数。"
-      },
-      "cfg": {
-        "tooltip": "downstream sampler 的 CFG scale。"
-      },
-      "sampler_name": {
-        "tooltip": "downstream sampler 名称。"
-      },
-      "scheduler": {
-        "tooltip": "downstream scheduler 名称。"
-      },
-      "denoise": {
-        "tooltip": "downstream denoise 值。"
-      },
-      "base_ctx": {
-        "tooltip": "要扩展的既有 rgthree 相容 context。sampler 设置键会被此节点的值覆盖。"
-      }
-    }
-  },
-  "DiTDCWPatch": {
-    "display_name": "DiT DCW Patch",
-    "description": "以 MODEL patch 形式套用 DCW post-step SNR-t bias correction。调校目标是 Anima flow-matching DiT。",
+  "DiTCFGFSGPatch": {
+    "display_name": "DiT CFG-FSG/DCW Patch",
+    "description": "以一個 MODEL patch 套用 DCW、SMC-CFG、CFG++、FSG。只需連接已啟用功能需要的 optional input。DCW auto 需要 clip 與 positive，SMC-CFG 需要 cfg，CFG++/FSG 需要 steps、cfg、sampler_name、scheduler、denoise。",
     "inputs": {
       "model": {
-        "tooltip": "要安装 DCW hook 的 DiT MODEL。"
+        "tooltip": "要套用 DCW、SMC-CFG、CFG++、FSG 中所選 correction 的 DiT MODEL。"
       },
       "enabled": {
-        "tooltip": "关闭时直接传回输入 MODEL。"
+        "tooltip": "關閉時直接返回輸入 MODEL。"
       },
       "dcw_mode": {
-        "tooltip": "DCW 模式，可选 off/manual/auto。"
+        "tooltip": "DCW mode。可選 off/manual/auto。"
       },
       "dcw_lambda": {
-        "tooltip": "manual DCW 强度。auto 模式会忽略。"
+        "tooltip": "manual DCW strength。auto mode 由 calibrator 預測 per-step 值。"
       },
       "dcw_band_mask": {
-        "tooltip": "manual 模式下套用 correction 的 Haar subband。"
+        "tooltip": "套用 manual DCW correction 的 Haar subband 範圍。auto mode 固定為 LL。"
       },
       "dcw_calibrator": {
-        "tooltip": "auto 模式使用的 fusion-head safetensors。"
-      },
-      "clip": {
-        "tooltip": "auto DCW calibrator setup 使用的 CLIP。"
-      },
-      "positive": {
-        "tooltip": "auto DCW calibrator setup 使用的 positive conditioning。"
-      }
-    }
-  },
-  "DiTCFGFSGPatch": {
-    "display_name": "DiT CFG-FSG Patch",
-    "description": "以单一 MODEL patch 套用依赖 CFG combine 或 sigma schedule 的 DiT correction，例如 SMC-CFG、CFG++、FSG。",
-    "inputs": {
-      "model": {
-        "tooltip": "要安装 CFG/FSG correction 的 DiT MODEL。"
-      },
-      "sampling_ctx": {
-        "tooltip": "DiT Sampler Context 或 rgthree 相容 context。数值必须与 downstream sampler 一致。"
-      },
-      "enabled": {
-        "tooltip": "关闭时直接传回输入 MODEL。"
+        "tooltip": "DCW auto mode 使用的 fusion-head safetensors artifact。"
       },
       "smc_cfg": {
-        "tooltip": "启用 alpha-adaptive SMC-CFG。不能与 CFG++ 同时使用。"
+        "tooltip": "啟用 α-adaptive SMC-CFG。不能與 CFG++ 同時使用。"
       },
       "adaptive_smc_alpha": {
-        "tooltip": "SMC-CFG alpha gain。0 会停用 SMC-CFG。"
+        "tooltip": "SMC-CFG adaptive switching gain。0 會停用 SMC-CFG。"
       },
       "smc_cfg_lambda": {
-        "tooltip": "SMC-CFG sliding manifold lambda。"
+        "tooltip": "SMC-CFG sliding-manifold slope λ。"
       },
       "cfgpp": {
-        "tooltip": "启用 CFG++ sigma-scheduled CFG combine。不能与 SMC-CFG 同时使用。"
+        "tooltip": "啟用 CFG++ σ-scheduled CFG combine。不能與 SMC-CFG 同時使用。"
       },
       "cfgpp_lambda": {
-        "tooltip": "CFG++ substrate lambda。cfgpp 启用时使用。"
+        "tooltip": "CFG++ correction strength。0 會停用 CFG++。"
       },
       "fsg": {
-        "tooltip": "启用 FSG fixed-point latent calibration。仅在 CFG 不为 1 时运行。"
+        "tooltip": "啟用 FSG fixed-point latent calibration。不能與 SMC-CFG 同時使用。"
       },
       "fsg_band_lo": {
-        "tooltip": "FSG 运行的 sigma band 下限。"
+        "tooltip": "FSG 啟用的 sigma band 下限。"
       },
       "fsg_band_hi": {
-        "tooltip": "FSG 运行的 sigma band 上限。"
+        "tooltip": "FSG 啟用的 sigma band 上限。"
       },
       "fsg_k": {
-        "tooltip": "FSG fixed-point iteration 次数。0 表示停用。"
+        "tooltip": "FSG fixed-point iteration 次數。0 會停用 FSG。"
       },
       "fsg_d_sigma": {
-        "tooltip": "FSG forward-backward stride delta sigma。"
+        "tooltip": "FSG finite-difference sigma delta。"
       },
       "fsg_gamma": {
-        "tooltip": "FSG calibration guidance gamma。0 表示使用 context 的 CFG scale。"
+        "tooltip": "FSG damping 值。0 表示不使用 damping。"
       },
       "replace_existing_cfg": {
-        "tooltip": "是否覆盖既有 sampler_cfg_function。只有明确需要时才开启。"
+        "tooltip": "是否覆寫既有 sampler_cfg_function。只有刻意讓此 patch 優先時才開啟。"
+      },
+      "steps": {
+        "tooltip": "downstream sampler 的 step 數。啟用 cfgpp 或 fsg 時需要。"
+      },
+      "cfg": {
+        "tooltip": "downstream sampler 的 CFG scale。啟用 smc_cfg、cfgpp、fsg 任一功能時需要。"
+      },
+      "sampler_name": {
+        "tooltip": "downstream sampler 名稱。啟用 cfgpp 或 fsg 時需要。"
+      },
+      "scheduler": {
+        "tooltip": "downstream scheduler 名稱。啟用 cfgpp 或 fsg 時需要。"
+      },
+      "denoise": {
+        "tooltip": "downstream sampler 的 denoise 值。啟用 cfgpp 或 fsg 時需要。"
+      },
+      "clip": {
+        "tooltip": "CLIP encoder。dcw_mode=auto 時需要。"
+      },
+      "positive": {
+        "tooltip": "positive conditioning。dcw_mode=auto 時需要。"
       }
     }
   },

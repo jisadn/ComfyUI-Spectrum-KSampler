@@ -299,108 +299,84 @@
       }
     }
   },
-  "DiTSamplerContext": {
-    "display_name": "DiT Sampler Context",
-    "description": "DiT model patcher が downstream sampler 設定を共有するための rgthree 互換 context を作成します。rgthree のインストールは不要です。",
-    "inputs": {
-      "steps": {
-        "tooltip": "downstream sampler の step 数です。"
-      },
-      "cfg": {
-        "tooltip": "downstream sampler の CFG scale です。"
-      },
-      "sampler_name": {
-        "tooltip": "downstream sampler 名です。"
-      },
-      "scheduler": {
-        "tooltip": "downstream scheduler 名です。"
-      },
-      "denoise": {
-        "tooltip": "downstream denoise 値です。"
-      },
-      "base_ctx": {
-        "tooltip": "拡張する既存の rgthree 互換 context です。sampler 設定キーはこのノードの値で上書きされます。"
-      }
-    }
-  },
-  "DiTDCWPatch": {
-    "display_name": "DiT DCW Patch",
-    "description": "DCW post-step SNR-t bias correction を MODEL patch として適用します。Anima 基準の flow-matching DiT 向けに調整されています。",
+  "DiTCFGFSGPatch": {
+    "display_name": "DiT CFG-FSG/DCW Patch",
+    "description": "DCW、SMC-CFG、CFG++、FSG を 1 つの MODEL patch として適用します。有効にした機能で必要な値だけ optional input に接続します。DCW auto は clip と positive、SMC-CFG は cfg、CFG++/FSG は steps、cfg、sampler_name、scheduler、denoise が必要です。",
     "inputs": {
       "model": {
-        "tooltip": "DCW hook をインストールする DiT MODEL です。"
+        "tooltip": "DCW、SMC-CFG、CFG++、FSG の選択した補正を適用する DiT MODEL です。"
       },
       "enabled": {
-        "tooltip": "無効にすると入力 MODEL をそのまま通します。"
+        "tooltip": "無効にすると入力 MODEL をそのまま返します。"
       },
       "dcw_mode": {
         "tooltip": "DCW mode です。off/manual/auto から選びます。"
       },
       "dcw_lambda": {
-        "tooltip": "manual DCW strength です。auto mode では無視されます。"
+        "tooltip": "manual DCW strength です。auto mode では calibrator が per-step 値を予測します。"
       },
       "dcw_band_mask": {
-        "tooltip": "manual mode で correction を適用する Haar subband です。"
+        "tooltip": "manual DCW correction を適用する Haar subband 範囲です。auto mode では LL に固定されます。"
       },
       "dcw_calibrator": {
-        "tooltip": "auto mode で使う fusion-head safetensors です。"
-      },
-      "clip": {
-        "tooltip": "auto DCW calibrator setup に使う CLIP です。"
-      },
-      "positive": {
-        "tooltip": "auto DCW calibrator setup に使う positive conditioning です。"
-      }
-    }
-  },
-  "DiTCFGFSGPatch": {
-    "display_name": "DiT CFG-FSG Patch",
-    "description": "SMC-CFG、CFG++、FSG など CFG combine または sigma schedule に依存する DiT correction を 1 つの MODEL patch として適用します。",
-    "inputs": {
-      "model": {
-        "tooltip": "CFG/FSG correction をインストールする DiT MODEL です。"
-      },
-      "sampling_ctx": {
-        "tooltip": "DiT Sampler Context または rgthree 互換 context です。downstream sampler と同じ値にしてください。"
-      },
-      "enabled": {
-        "tooltip": "無効にすると入力 MODEL をそのまま通します。"
+        "tooltip": "DCW auto mode で使う fusion-head safetensors artifact です。"
       },
       "smc_cfg": {
-        "tooltip": "alpha-adaptive SMC-CFG を有効化します。CFG++ とは同時に使えません。"
+        "tooltip": "α-adaptive SMC-CFG を有効にします。CFG++ と同時には使えません。"
       },
       "adaptive_smc_alpha": {
-        "tooltip": "SMC-CFG alpha gain です。0 なら SMC-CFG は無効です。"
+        "tooltip": "SMC-CFG adaptive switching gain です。0 で SMC-CFG を無効にします。"
       },
       "smc_cfg_lambda": {
-        "tooltip": "SMC-CFG sliding manifold lambda です。"
+        "tooltip": "SMC-CFG sliding-manifold slope λ です。"
       },
       "cfgpp": {
-        "tooltip": "CFG++ sigma-scheduled CFG combine を有効化します。SMC-CFG とは同時に使えません。"
+        "tooltip": "CFG++ σ-scheduled CFG combine を有効にします。SMC-CFG と同時には使えません。"
       },
       "cfgpp_lambda": {
-        "tooltip": "CFG++ substrate lambda です。cfgpp が有効なときに使います。"
+        "tooltip": "CFG++ correction strength です。0 で CFG++ を無効にします。"
       },
       "fsg": {
-        "tooltip": "FSG fixed-point latent calibration を有効化します。CFG が 1 でない場合のみ動作します。"
+        "tooltip": "FSG fixed-point latent calibration を有効にします。SMC-CFG と同時には使えません。"
       },
       "fsg_band_lo": {
-        "tooltip": "FSG が動作する sigma band の下限です。"
+        "tooltip": "FSG が有効になる sigma band の下限です。"
       },
       "fsg_band_hi": {
-        "tooltip": "FSG が動作する sigma band の上限です。"
+        "tooltip": "FSG が有効になる sigma band の上限です。"
       },
       "fsg_k": {
-        "tooltip": "FSG fixed-point iteration 数です。0 なら無効です。"
+        "tooltip": "FSG fixed-point iteration 数です。0 で FSG を無効にします。"
       },
       "fsg_d_sigma": {
-        "tooltip": "FSG forward-backward stride delta sigma です。"
+        "tooltip": "FSG finite-difference sigma delta です。"
       },
       "fsg_gamma": {
-        "tooltip": "FSG calibration guidance gamma です。0 なら context の CFG scale を使います。"
+        "tooltip": "FSG damping 値です。0 で damping を使いません。"
       },
       "replace_existing_cfg": {
-        "tooltip": "既存の sampler_cfg_function を上書きするかどうかです。意図した場合のみ有効にしてください。"
+        "tooltip": "既存の sampler_cfg_function を上書きするかを選びます。この patch を意図的に優先するときだけ有効にしてください。"
+      },
+      "steps": {
+        "tooltip": "downstream sampler の step 数です。cfgpp または fsg を有効にすると必要です。"
+      },
+      "cfg": {
+        "tooltip": "downstream sampler の CFG scale です。smc_cfg、cfgpp、fsg のいずれかを有効にすると必要です。"
+      },
+      "sampler_name": {
+        "tooltip": "downstream sampler 名です。cfgpp または fsg を有効にすると必要です。"
+      },
+      "scheduler": {
+        "tooltip": "downstream scheduler 名です。cfgpp または fsg を有効にすると必要です。"
+      },
+      "denoise": {
+        "tooltip": "downstream sampler の denoise 値です。cfgpp または fsg を有効にすると必要です。"
+      },
+      "clip": {
+        "tooltip": "CLIP encoder です。dcw_mode=auto で必要です。"
+      },
+      "positive": {
+        "tooltip": "positive conditioning です。dcw_mode=auto で必要です。"
       }
     }
   },

@@ -299,108 +299,84 @@
       }
     }
   },
-  "DiTSamplerContext": {
-    "display_name": "DiT 샘플러 컨텍스트",
-    "description": "DiT 모델 패처가 downstream sampler 설정을 공유하도록 rgthree 호환 컨텍스트를 만듭니다. rgthree 설치는 필요하지 않습니다.",
-    "inputs": {
-      "steps": {
-        "tooltip": "downstream sampler의 step 수입니다."
-      },
-      "cfg": {
-        "tooltip": "downstream sampler의 CFG scale입니다."
-      },
-      "sampler_name": {
-        "tooltip": "downstream sampler 이름입니다."
-      },
-      "scheduler": {
-        "tooltip": "downstream scheduler 이름입니다."
-      },
-      "denoise": {
-        "tooltip": "downstream denoise 값입니다."
-      },
-      "base_ctx": {
-        "tooltip": "확장할 기존 rgthree 호환 context입니다. sampler 설정 키는 이 노드 값으로 덮어씁니다."
-      }
-    }
-  },
-  "DiTDCWPatch": {
-    "display_name": "DiT DCW 패치",
-    "description": "DCW post-step SNR-t bias correction을 MODEL 패치로 적용합니다. Anima 기준 flow-matching DiT에 맞춰 튜닝되었습니다.",
+  "DiTCFGFSGPatch": {
+    "display_name": "DiT CFG-FSG/DCW 패치",
+    "description": "DCW, SMC-CFG, CFG++, FSG를 하나의 MODEL 패치로 적용합니다. 기능을 켰을 때 필요한 값만 optional input으로 연결합니다. DCW auto는 clip과 positive가 필요하고, SMC-CFG는 cfg가 필요하며, CFG++/FSG는 steps, cfg, sampler_name, scheduler, denoise가 필요합니다.",
     "inputs": {
       "model": {
-        "tooltip": "DCW hook을 설치할 DiT MODEL입니다."
+        "tooltip": "DCW, SMC-CFG, CFG++, FSG 중 선택한 보정을 적용할 DiT MODEL입니다."
       },
       "enabled": {
-        "tooltip": "끄면 입력 MODEL을 그대로 통과시킵니다."
+        "tooltip": "끄면 입력 MODEL을 그대로 반환합니다."
       },
       "dcw_mode": {
         "tooltip": "DCW 모드입니다. off/manual/auto 중 선택합니다."
       },
       "dcw_lambda": {
-        "tooltip": "manual DCW 강도입니다. auto 모드에서는 무시됩니다."
+        "tooltip": "manual DCW 강도입니다. auto 모드에서는 calibrator가 per-step 값을 예측합니다."
       },
       "dcw_band_mask": {
-        "tooltip": "manual 모드에서 correction을 적용할 Haar subband입니다."
+        "tooltip": "manual DCW correction을 적용할 Haar subband 범위입니다. auto 모드는 LL로 고정됩니다."
       },
       "dcw_calibrator": {
-        "tooltip": "auto 모드에서 사용할 fusion-head safetensors입니다."
-      },
-      "clip": {
-        "tooltip": "auto DCW calibrator setup에 사용할 CLIP입니다."
-      },
-      "positive": {
-        "tooltip": "auto DCW calibrator setup에 사용할 positive conditioning입니다."
-      }
-    }
-  },
-  "DiTCFGFSGPatch": {
-    "display_name": "DiT CFG-FSG 패치",
-    "description": "SMC-CFG, CFG++, FSG처럼 CFG combine 또는 sigma schedule에 의존하는 DiT correction을 하나의 MODEL 패치로 적용합니다.",
-    "inputs": {
-      "model": {
-        "tooltip": "CFG/FSG correction을 설치할 DiT MODEL입니다."
-      },
-      "sampling_ctx": {
-        "tooltip": "DiT Sampler Context 또는 rgthree 호환 context입니다. downstream sampler와 값이 같아야 합니다."
-      },
-      "enabled": {
-        "tooltip": "끄면 입력 MODEL을 그대로 통과시킵니다."
+        "tooltip": "DCW auto mode에서 사용할 fusion-head safetensors artifact입니다."
       },
       "smc_cfg": {
-        "tooltip": "alpha-adaptive SMC-CFG를 켭니다. CFG++와 동시에 사용할 수 없습니다."
+        "tooltip": "α-adaptive SMC-CFG를 켭니다. CFG++와 동시에 사용할 수 없습니다."
       },
       "adaptive_smc_alpha": {
-        "tooltip": "SMC-CFG alpha gain입니다. 0이면 SMC-CFG가 비활성화됩니다."
+        "tooltip": "SMC-CFG adaptive switching gain입니다. 0이면 SMC-CFG가 꺼집니다."
       },
       "smc_cfg_lambda": {
-        "tooltip": "SMC-CFG sliding manifold lambda입니다."
+        "tooltip": "SMC-CFG sliding-manifold slope λ입니다."
       },
       "cfgpp": {
-        "tooltip": "CFG++ sigma-scheduled CFG combine을 켭니다. SMC-CFG와 동시에 사용할 수 없습니다."
+        "tooltip": "CFG++ σ-scheduled CFG combine을 켭니다. SMC-CFG와 동시에 사용할 수 없습니다."
       },
       "cfgpp_lambda": {
-        "tooltip": "CFG++ substrate lambda입니다. cfgpp가 켜졌을 때 사용합니다."
+        "tooltip": "CFG++ correction 강도입니다. 0이면 CFG++가 꺼집니다."
       },
       "fsg": {
-        "tooltip": "FSG fixed-point latent calibration을 켭니다. CFG 1이 아닌 경우에만 동작합니다."
+        "tooltip": "FSG fixed-point latent calibration을 켭니다. SMC-CFG와 동시에 사용할 수 없습니다."
       },
       "fsg_band_lo": {
-        "tooltip": "FSG가 동작할 sigma band 하한입니다."
+        "tooltip": "FSG가 활성화되는 sigma band의 하한입니다."
       },
       "fsg_band_hi": {
-        "tooltip": "FSG가 동작할 sigma band 상한입니다."
+        "tooltip": "FSG가 활성화되는 sigma band의 상한입니다."
       },
       "fsg_k": {
-        "tooltip": "FSG fixed-point 반복 횟수입니다. 0이면 비활성입니다."
+        "tooltip": "FSG fixed-point iteration 수입니다. 0이면 FSG가 꺼집니다."
       },
       "fsg_d_sigma": {
-        "tooltip": "FSG forward-backward stride delta sigma입니다."
+        "tooltip": "FSG finite-difference sigma delta입니다."
       },
       "fsg_gamma": {
-        "tooltip": "FSG calibration guidance gamma입니다. 0이면 context의 CFG scale을 사용합니다."
+        "tooltip": "FSG damping 값입니다. 0이면 damping을 쓰지 않습니다."
       },
       "replace_existing_cfg": {
-        "tooltip": "기존 sampler_cfg_function을 덮어쓸지 여부입니다. 의도한 경우에만 켭니다."
+        "tooltip": "기존 sampler_cfg_function을 덮어쓸지 선택합니다. 의도적으로 이 패치를 우선할 때만 켭니다."
+      },
+      "steps": {
+        "tooltip": "downstream sampler의 step 수입니다. cfgpp 또는 fsg를 켤 때 필요합니다."
+      },
+      "cfg": {
+        "tooltip": "downstream sampler의 CFG scale입니다. smc_cfg, cfgpp, fsg 중 하나를 켤 때 필요합니다."
+      },
+      "sampler_name": {
+        "tooltip": "downstream sampler 이름입니다. cfgpp 또는 fsg를 켤 때 필요합니다."
+      },
+      "scheduler": {
+        "tooltip": "downstream scheduler 이름입니다. cfgpp 또는 fsg를 켤 때 필요합니다."
+      },
+      "denoise": {
+        "tooltip": "downstream sampler의 denoise 값입니다. cfgpp 또는 fsg를 켤 때 필요합니다."
+      },
+      "clip": {
+        "tooltip": "CLIP encoder입니다. dcw_mode=auto일 때 필요합니다."
+      },
+      "positive": {
+        "tooltip": "positive conditioning입니다. dcw_mode=auto일 때 필요합니다."
       }
     }
   },
