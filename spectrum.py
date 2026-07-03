@@ -230,6 +230,15 @@ def _can_use_cached_prediction(
     if state.compat_policy == "legacy":
         return True
     if not _wrapper_cache_safe(old_wrapper):
+        if not state.unsafe_wrapper_warned:
+            logger.warning(
+                "Spectrum: compat_policy=%s is using actual forwards because a "
+                "previous model_function_wrapper is not tagged cache-safe. Use "
+                "legacy for the fastest wrapper chain, or tag cache-neutral "
+                "wrappers with __spectrum_cache_safe__=True.",
+                state.compat_policy,
+            )
+            state.unsafe_wrapper_warned = True
         if state.verbose:
             logger.info(
                 "Spectrum: compat_policy=%s blocks cached step because the "
@@ -396,6 +405,7 @@ class SpectrumState:
         self.captured_feat: Optional[torch.Tensor] = None
         self.patch_consumed = False
         self.input_shape: Optional[tuple] = None
+        self.unsafe_wrapper_warned = False
 
         # one_sampler_only: the ComfyUI prompt_id this state was last armed for.
         # The patched MODEL (and this state) is cached across workflow re-runs,
@@ -419,6 +429,7 @@ class SpectrumState:
         self.consec_cached = 0
         self.clear_forecasters()
         self.captured_feat = None
+        self.unsafe_wrapper_warned = False
         self.sea_accum = 0.0
         self.sea_prev = None
         self.sea_dists = []

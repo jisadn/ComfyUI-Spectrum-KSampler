@@ -57,7 +57,7 @@ Place the **KSampler (Spectrum)** node where you'd normally use a KSampler. It h
 
 > **Migration:** the former `KSampler (Spectrum + Mod Guidance)` and `KSampler (Spectrum SEA + Mod Guidance)` nodes are gone — their behavior is the default of this unified node. Their class keys remain as hidden aliases so existing saved workflows still load (they resolve to this node), but they no longer appear in the add-node menu. DCW + raw forecasting/guidance scalars still live on the **Advanced** node.
 
-Works with any ComfyUI sampler (Euler, DPM, er_sde, etc.) because caching is handled transparently inside a model function wrapper. Chains with other model wrappers (Flex Attention, Flash Attention 4, etc.).
+Works with any ComfyUI sampler (Euler, DPM, er_sde, etc.) because caching is handled transparently inside a model function wrapper. Chains with other model wrappers (Flex Attention, Flash Attention 4, etc.) under the default `legacy` cache policy. In `conservative` or `strict`, an upstream `model_function_wrapper` must be tagged cache-safe or Spectrum will fall back to actual DiT forwards.
 
 ### Standalone MODEL patcher
 
@@ -100,6 +100,8 @@ Set the patcher's `steps` to the downstream sampler's `steps`, then start with `
 | `legacy` | You want the original fastest Spectrum behavior and backwards-compatible saved workflows. | The normal Spectrum schedule says the step can be cached, unless an explicit cache veto callback blocks it. Existing wrappers may still be bypassed on cached steps, matching the old behavior. |
 | `conservative` | You want safer behavior with custom samplers, shape changes, wrapper chains, or cache veto callbacks. | The normal Spectrum schedule allows caching and the runtime checks pass: valid batch split, matching latent shape, expected step count, no unsafe wrapper, and no veto callback blocking cache. Otherwise the step runs actual DiT forward. |
 | `strict` | You are using exact artist mixes, multi-positive conditioning, or other flows where each conditioning branch must keep its own forecaster history. | Everything required by `conservative`, plus ComfyUI per-conditioning UUID branch keys must be available. If UUIDs are missing, it runs actual DiT forward instead of sharing a coarse cond/uncond cache. |
+
+For wrapper chains, `conservative` and `strict` treat an existing `model_function_wrapper` as unsafe unless it explicitly sets `__spectrum_cache_safe__ = True`. This protects wrappers that must run on every model call, but it also means untagged cache-neutral wrappers, including attention-backend swaps, run full actual DiT forwards under those policies. Use `legacy` for the fastest untagged wrapper chain, or tag cache-neutral wrappers before Spectrum.
 
 Why this matters: Spectrum forecasts DiT features from previous actual steps. In a simple prompt there is usually one positive branch and one negative branch. In exact artist mix, each artist is a separate positive conditioning branch. `strict` keeps those branch histories separate by requiring ComfyUI UUID keys before caching; without them, it avoids cached predictions rather than mixing unrelated artist trajectories.
 
