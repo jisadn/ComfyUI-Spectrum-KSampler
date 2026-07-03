@@ -734,6 +734,12 @@ def apply_dit_spectrum_patch(
 
     _ensure_capture_hook(dit)
     old_wrapper = m.model_options.get("model_function_wrapper")
+    # Captured as a local so the wrapper closure does NOT hold the patcher
+    # itself. A wrapper closing over `m` forms a cycle through m.model_options;
+    # patcher clones then die only in a full gc batch, and CPython clears
+    # parent weakrefs before LoadedModel._switch_parent runs — stranding the
+    # entry → ComfyUI logs "memory leak with model …" on every later prompt.
+    model_options = m.model_options
 
     def actual_forward(apply_model, args, input_x, timestep, c):
         if old_wrapper is not None:
@@ -805,7 +811,7 @@ def apply_dit_spectrum_patch(
             timestep,
             c,
             old_wrapper,
-            m.model_options,
+            model_options,
             args,
             valid_chunks,
         ):
@@ -1131,6 +1137,9 @@ def spectrum_sample(
     dit.final_layer._spectrum_state = state
 
     old_wrapper = m.model_options.get("model_function_wrapper")
+    # Local capture keeps the transient clone `m` OUT of the wrapper closure
+    # (same strand hazard as documented at the patch-node wrapper above).
+    model_options = m.model_options
 
     def spectrum_wrapper(apply_model, args):
         input_x = args["input"]
@@ -1174,7 +1183,7 @@ def spectrum_sample(
             timestep,
             c,
             old_wrapper,
-            m.model_options,
+            model_options,
             args,
             valid_chunks,
         ):
@@ -1301,6 +1310,12 @@ def spectrum_sample(
         dit.final_layer._spectrum_state = None
         if hasattr(dit, "_mod_pooled_proj"):
             del dit._mod_pooled_proj
+        # Drop this run's wrapper from the transient clone. Belt-and-braces
+        # with the closure fix above: guarantees `m` (and its parent clone
+        # chain) dies by plain refcount when this frame exits, so ComfyUI's
+        # LoadedModel parent-rescue (weakref-based, defeated by same-gc-batch
+        # death) never strands an entry for this sample.
+        m.model_options.pop("model_function_wrapper", None)
 
     if pad_h or pad_w:
         samples = samples[..., : orig_hw[0], : orig_hw[1]].contiguous()
