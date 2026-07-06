@@ -53,6 +53,9 @@
       },
       "clip": {
         "tooltip": "encode quality tag 的 CLIP。使用 mod guidance 時連接。"
+      },
+      "xattn_boost": {
+        "tooltip": "前置 cross-attn 增强 λ。1.0 表示关闭（完全一致）。在高 σ（生成构图的阶段）对条件 forward 的 cross-attn 残差乘以 λ，增强弱标签的贴合度以及关系/属性绑定，同时保持渲染风格。推荐 1.5，最高 3.0（越高会带来轻微的整体降饱和，并可能放大取景/裁剪等不需要的标签）。仅增强实际 forward，预测步会从增强后的特征外推。可与 SMC-CFG / CFG++ / FSG / mod-guidance 组合使用。"
       }
     }
   },
@@ -176,6 +179,12 @@
       },
       "smc_cfg_lambda": {
         "tooltip": "SMC-CFG sliding-manifold slope lambda。"
+      },
+      "xattn_boost": {
+        "tooltip": "前置 cross-attn 增强 λ。1.0 表示关闭（完全一致）。在高 σ（生成构图的阶段）对条件 forward 的 cross-attn 残差乘以 λ，增强弱标签的贴合度以及关系/属性绑定，同时保持渲染风格。推荐 1.5，最高 3.0（越高会带来轻微的整体降饱和，并可能放大取景/裁剪等不需要的标签）。仅增强实际 forward，预测步会从增强后的特征外推。可与 SMC-CFG / CFG++ / FSG / mod-guidance 组合使用。"
+      },
+      "xattn_boost_band": {
+        "tooltip": "cross-attn 增强的 σ 截断（在 σ ≥ band 时生效）。默认 0.85 = cross-attn 驱动的下限 σ（28 步中约 10 步）。调高到 0.95 可只在高 σ 区间窄范围应用。低于约 0.85 时几乎没有可放大的文本驱动。当 xattn_boost=1.0 时忽略。"
       }
     }
   },

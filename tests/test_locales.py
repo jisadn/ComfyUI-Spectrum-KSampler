@@ -23,6 +23,7 @@ EXPECTED_INPUTS = {
         "mod_w_profile",
         "refresh_ratio",
         "adaptive_smc_alpha",
+        "xattn_boost",
         "fsg",
         "clip",
     },
@@ -66,6 +67,8 @@ EXPECTED_INPUTS = {
         "fsg_gamma",
         "adaptive_smc_alpha",
         "smc_cfg_lambda",
+        "xattn_boost",
+        "xattn_boost_band",
     },
     "SpectrumSPDKSampler": {
         "model",

@@ -54,6 +54,7 @@ Place the **KSampler (Spectrum)** node where you'd normally use a KSampler. It h
 - **Modulation guidance** — wire a `CLIP` and pick a `mod_w_profile` (default `step_i8_skip27`; `off` to disable). With no CLIP connected and a profile selected, mod guidance is skipped with a console warning rather than erroring — so a graph that only wires the sampler still runs.
 - **SEA scheduling** — the `refresh_ratio` dial chooses *which* steps to skip: `0` (default) = SEA auto (content-aware, compute-matched to the growing window), `-1` = SEA off (plain growing window, accelerates from the first run with no calibration), `>0` = explicit refresh ratio.
 - **α-adaptive SMC-CFG** — `adaptive_smc_alpha`.
+- **Front-loaded cross-attn boost** — `xattn_boost` (`1.0` = off). See [Cross-attn boost](#cross-attn-boost-front-loaded-text-adherence) below.
 
 > **Migration:** the former `KSampler (Spectrum + Mod Guidance)` and `KSampler (Spectrum SEA + Mod Guidance)` nodes are gone — their behavior is the default of this unified node. Their class keys remain as hidden aliases so existing saved workflows still load (they resolve to this node), but they no longer appear in the add-node menu. DCW + raw forecasting/guidance scalars still live on the **Advanced** node.
 
@@ -185,6 +186,17 @@ The default ~12MB `pooled_text_proj` weight is auto-downloaded on first use from
 Per-block guidance schedules address quality drift on LoRAs whose distribution sits far from the positive-prompt axis (e.g. early blocks blowing out tonal DC into uniform color collapse). The default `step_i8_skip27` protects blocks 0–7 and the final compensation block 27 from the steering delta while keeping the base text projection uniform across all blocks. See [`docs/methods/mod-guidance.md`](https://github.com/sorryhyun/anima_lora/blob/main/docs/methods/mod-guidance.md) in anima_lora for the underlying rationale.
 
 **Decoupled negative (`quality_neg`).** The mod-guidance delta is `proj(quality_tags) − proj(negative)`. By default the node bound that negative to the **CFG** negative — the broad kitchen-sink list (`worst quality, …, sepia, speech bubble, borders, …`) whose job is velocity-space repulsion, not to be a clean quality counter-pole. Geometrically the resulting axis is *anti-correlated* (cos ≈ −0.38) with the intended `quality_up − quality_down` direction and ~40% smaller in magnitude, so the push both misdirects and weakens. Set `quality_neg` to a focused counter-pole (e.g. `worst quality, score_1`) to recover a pure quality axis; the CFG negative keeps its broad role unchanged. The mod-guidance head is max-pooled and trained on max-pooled inputs — `quality_neg` does **not** change pooling. Leaving it empty reproduces the pre-decoupling result bit-for-bit. (The anima_lora CLI was already decoupled via `--mod_neg_prompt`; this brings the Comfy node in line.)
+
+## Cross-attn boost (front-loaded text adherence)
+
+Both sampler nodes expose `xattn_boost` — a single dial (`1.0` = off) that scales **every block's cross-attn residual by λ on the conditional forward only**, gated to high σ (the *plan-writing* window where cross-attn text drive actually exists — it peaks at σ = 1 and floors out below σ ≈ 0.85). Amplifying the text voice while the plan is still forming lifts **weak-tag adherence** and **relation / attribute bindings** (multi-subject role↔attribute, object relations, scene layout) without touching the self-attn + MLP that render the style. See [`docs/inference/xattn_boost.md`](https://github.com/sorryhyun/anima_lora/blob/main/docs/inference/xattn_boost.md) in anima_lora.
+
+- **`xattn_boost`** (both nodes) — λ. `1.0` = off (exact identity). **~1.5 recommended**; up to `3.0` for stubborn tags. Higher λ trades a mild global desaturation for stronger adherence and can amplify *unwanted* caption tags too (framing / crop priors ride along, and with style/artist tokens in the prompt the content win attenuates as the gain splits across tokens). It moves things the model already knows — a multiplicative lever on ~zero signal is still ~zero, so it will not conjure unknown concepts.
+- **`xattn_boost_band`** (Advanced node only) — σ cutoff; boost fires at σ ≥ band. Default `0.85` (≈ 10 of 28 shifted-schedule steps). Raise toward `0.95` for a tighter high-σ-only window.
+
+Only **actual** (block-running) forwards are boosted; Spectrum's forecast steps skip the blocks and extrapolate from the boosted cond features, consistent with the boost. Because it acts on the cond forward (not the cond/uncond combine or the modulation pathway), it **composes with** SMC-CFG, CFG++, FSG, DCW, and mod-guidance. Under CFG = 1 there is no uncond pass, so the single forward is boosted.
+
+The boost is applied as an in-graph per-block buffer multiply (not a Python hook), so it is **`torch.compile` / AnimaBlockCompile safe** — the gain retunes per step with no recompile, the same buffer-read pattern the mod-guidance path uses.
 
 ## SMC-CFG (α-adaptive sliding-mode CFG)
 

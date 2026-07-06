@@ -518,6 +518,149 @@ def _ensure_capture_hook(dit) -> None:
     final_layer._spectrum_hook_installed = True
 
 
+# ---------------------------------------------------------------------------
+# Front-loaded cross-attn boost (--xattn_boost)
+#
+# Scales every block's cross-attn residual by λ on the conditional forward only,
+# gated to σ ≥ band — the plan-writing window where cross-attn text drive exists
+# (peaks σ=1, floor below σ≈0.85). Amplifies weak-tag adherence / relation
+# bindings without touching self-attn/MLP style. Mirror of anima_lora's
+# library.inference.adapters.set_xattn_gain, adapted to ComfyUI's batched CFG.
+#
+# COMPILE COMPATIBILITY. AnimaBlockCompile runs torch.compile on each *whole*
+# transformer block (`set_torch_compile_wrapper` keys = diffusion_model.blocks.i),
+# so the cross-attn multiply must live *inside* the compiled graph as a buffer
+# read — a plain forward hook on the cross_attn submodule is traced over and
+# silently baked at its trace-time value (that was the "no effect" bug). Instead
+# we register a non-persistent `_xattn_gain` buffer on each block's cross_attn
+# and monkeypatch its `forward` to multiply the output by that buffer (exactly
+# scaling `result` in comfy's `x = result * gate + x`, i.e. equivalent to
+# scaling the AdaLN gate_cross_attn — native anima's `Block._xattn_gain`). The
+# buffer is a graph input, so updating it in place (`copy_`/`fill_`) retunes the
+# boost per step with NO recompile — the same pattern the mod-guidance path uses.
+# torch.compile wraps the same block object (`_orig_mod`) and only swaps it in
+# temporarily, so patching before the first sample lands in the trace.
+#
+# ComfyUI batches cond+uncond in one forward, so the gain is a per-sample
+# (B, 1, 1) buffer (λ on cond rows, 1.0 on uncond). The patch is installed once
+# and left in place (removing it would flip the traced forward and force a
+# recompile); it is neutralized to 1.0 (exact identity) whenever the boost is
+# off, so it never leaks into other samplers sharing the DiT. Only actual
+# (block-running) forwards carry the boost; forecast steps skip the blocks and
+# extrapolate from the boosted cond features, consistent with the boost.
+# ---------------------------------------------------------------------------
+
+
+def _ensure_xattn_gain_patch(dit) -> bool:
+    """Patch every block's ``cross_attn`` with a buffer-scaled forward (once).
+
+    Registers a non-persistent ``_xattn_gain`` buffer (init 1.0 = identity) on
+    each ``cross_attn`` and wraps its ``forward`` to multiply the output by that
+    buffer. Idempotent. Returns False (and logs) when the DiT has no
+    block/cross_attn structure, so the caller disables the boost instead of
+    crashing on a non-Anima model.
+    """
+    if getattr(dit, "_xattn_gain_patched", False):
+        return True
+
+    blocks = getattr(dit, "blocks", None)
+    if blocks is None or not all(hasattr(b, "cross_attn") for b in blocks):
+        logger.warning(
+            "Spectrum xattn boost: DiT has no blocks[*].cross_attn to patch; "
+            "disabling the boost for this run."
+        )
+        return False
+
+    def _make_forward(orig_forward, module):
+        def _boosted_forward(*args, **kwargs):
+            out = orig_forward(*args, **kwargs)
+            return out * module._xattn_gain.to(out.dtype)
+
+        return _boosted_forward
+
+    for block in blocks:
+        ca = block.cross_attn
+        if getattr(ca, "_xattn_gain_patched", False):
+            continue
+        try:
+            p = next(ca.parameters())
+            dev, dt = p.device, p.dtype
+        except StopIteration:  # no params — fall back to defaults
+            dev, dt = None, torch.float32
+        ca.register_buffer(
+            "_xattn_gain", torch.ones((1, 1, 1), device=dev, dtype=dt), persistent=False
+        )
+        ca.forward = _make_forward(ca.forward, ca)
+        ca._xattn_gain_patched = True
+    dit._xattn_gain_patched = True
+    return True
+
+
+def _xattn_gain_vector(cond_or_uncond, batch_size, boost, device, dtype):
+    """Build a ``(B, 1, 1)`` per-sample gain: λ on cond chunks, 1.0 on uncond.
+
+    ``cond_or_uncond`` is ComfyUI's per-chunk tag list (0 = cond/positive,
+    1 = uncond/negative); the batch splits into ``len(cond_or_uncond)`` equal
+    contiguous chunks. Returns ``None`` when the chunks don't divide the batch
+    (skip the boost this call rather than mis-mapping rows).
+    """
+    n = len(cond_or_uncond)
+    if n == 0 or batch_size % n != 0:
+        return None
+    chunk = batch_size // n
+    gains = torch.ones((batch_size, 1, 1), device=device, dtype=dtype)
+    for j, cou in enumerate(cond_or_uncond):
+        if int(cou) == 0:  # cond / positive branch
+            gains[j * chunk : (j + 1) * chunk] = boost
+    return gains
+
+
+def _set_xattn_gain(dit, cond_or_uncond, batch_size, boost, band, sigma_val):
+    """Write the per-block cross-attn gain buffers for one actual forward.
+
+    Sets a ``(B, 1, 1)`` buffer on every ``cross_attn``: the boosted λ-vector
+    when ``sigma_val >= band``, else identity ones (still shaped ``(B, 1, 1)`` so
+    the buffer shape — and thus the compiled block graph — stays fixed across
+    boosted / unboosted steps). Reuses the existing buffer in place (``copy_``)
+    when the shape matches, so no recompile; only a batch-size change reallocates
+    (one recompile). Returns True when a boost was actually applied.
+    """
+    blocks = dit.blocks
+    ref = blocks[0].cross_attn._xattn_gain
+    gain_vec = None
+    if sigma_val >= band:
+        gain_vec = _xattn_gain_vector(
+            cond_or_uncond, batch_size, boost, ref.device, ref.dtype
+        )
+    for block in blocks:
+        ca = block.cross_attn
+        buf = ca._xattn_gain
+        if gain_vec is None:
+            target = torch.ones((batch_size, 1, 1), device=buf.device, dtype=buf.dtype)
+        else:
+            target = gain_vec.to(device=buf.device, dtype=buf.dtype)
+        if buf.shape == target.shape:
+            buf.copy_(target)
+        else:
+            ca._xattn_gain = target  # batch-size change → one recompile
+    return gain_vec is not None
+
+
+def _reset_xattn_gain(dit) -> None:
+    """Neutralize the cross-attn gain buffers to exact identity (in place).
+
+    Keeps the patch installed (so no recompile) but makes it a no-op — used
+    after each forward and at teardown so a leftover boost never bleeds into a
+    later step or another sampler sharing the DiT.
+    """
+    if not getattr(dit, "_xattn_gain_patched", False):
+        return
+    for block in dit.blocks:
+        buf = getattr(block.cross_attn, "_xattn_gain", None)
+        if buf is not None:
+            buf.fill_(1.0)
+
+
 def _resolve_live_components(apply_model, fallback_dit, fallback_model_sampling, state):
     """Resolve the DiT + model_sampling that actually run *this* forward.
 
@@ -892,6 +1035,8 @@ def spectrum_sample(
     fsg_k: int = 3,
     fsg_d_sigma: float = 0.1,
     fsg_gamma: float = 0.0,
+    xattn_boost: float = 1.0,
+    xattn_boost_band: float = 0.85,
     compat_policy: str = DEFAULT_COMPAT_POLICY,
 ):
     """Shared Spectrum sampling logic used by all node tiers.
@@ -946,6 +1091,17 @@ def spectrum_sample(
         diverges). K=3 iterations (each ~3 extra forwards). Δσ=0.1 stride.
         fsg_gamma=0 → use the CFG scale (=guidance); keep ≈4 even under CFG++
         (matching it to the CFG++ effective weight diverges).
+    xattn_boost: Front-loaded cross-attn residual gain λ, applied to the
+        conditional forward only at σ ≥ xattn_boost_band. 1.0 = off (exact
+        identity). ~1.5 is the mild point, up to ~3.0; higher λ trades a mild
+        global desaturation for stronger weak-tag / relation-binding adherence.
+        Boosts only actual (block-running) forwards; forecast steps extrapolate
+        from the boosted cond features. Composes with SMC-CFG / CFG++ / DCW /
+        mod-guidance (they touch the combine or modulation, not the cond
+        forward). See anima_lora/docs/inference/xattn_boost.md.
+    xattn_boost_band: σ cutoff for xattn_boost (boost fires at σ ≥ band).
+        Default 0.85 = the cross-attn drive-floor σ (~10 of 28 shifted-schedule
+        steps). Raise for a tighter high-σ-only window.
     """
     compat_policy = _normalize_compat_policy(compat_policy)
     m = model.clone()
@@ -1136,6 +1292,23 @@ def spectrum_sample(
     _ensure_capture_hook(dit)
     dit.final_layer._spectrum_state = state
 
+    # --xattn_boost: install the per-block cross-attn gain hooks once and arm
+    # them per-forward inside the wrapper. 1.0 = off (exact identity, no hook
+    # cost beyond a None-read). Applies to actual forwards only; the cached
+    # fast-forward path skips the blocks entirely.
+    xattn_boost_active = xattn_boost is not None and not math.isclose(
+        float(xattn_boost), 1.0
+    )
+    if xattn_boost_active:
+        xattn_boost_active = _ensure_xattn_gain_patch(dit)
+        if xattn_boost_active:
+            logger.info(
+                "Spectrum xattn boost active: λ=%.3g at σ ≥ %.3g (cond forward "
+                "only, compile-safe buffer path).",
+                float(xattn_boost),
+                float(xattn_boost_band),
+            )
+
     old_wrapper = m.model_options.get("model_function_wrapper")
     # Local capture keeps the transient clone `m` OUT of the wrapper closure
     # (same strand hazard as documented at the patch-node wrapper above).
@@ -1202,10 +1375,28 @@ def spectrum_sample(
         state.mode = "actual"
         state.captured_feat = None
 
-        if old_wrapper is not None:
-            result = old_wrapper(apply_model, args)
-        else:
-            result = apply_model(input_x, timestep, **c)
+        # Arm the cross-attn boost for this actual forward: λ on cond rows at
+        # σ ≥ band, identity elsewhere (written into the per-block gain buffers,
+        # read inside the compiled block graph). Reset in finally so no gain
+        # leaks into the next forward (cached steps never run the blocks).
+        boost_armed = False
+        if xattn_boost_active:
+            boost_armed = _set_xattn_gain(
+                dit,
+                cond_or_uncond,
+                input_x.shape[0],
+                float(xattn_boost),
+                float(xattn_boost_band),
+                sigma_val,
+            )
+        try:
+            if old_wrapper is not None:
+                result = old_wrapper(apply_model, args)
+            else:
+                result = apply_model(input_x, timestep, **c)
+        finally:
+            if boost_armed:
+                _reset_xattn_gain(dit)
 
         feat = state.captured_feat
         _update_forecasters_from_feature(
@@ -1308,6 +1499,8 @@ def spectrum_sample(
             )
     finally:
         dit.final_layer._spectrum_state = None
+        if xattn_boost_active:
+            _reset_xattn_gain(dit)
         if hasattr(dit, "_mod_pooled_proj"):
             del dit._mod_pooled_proj
         # Drop this run's wrapper from the transient clone. Belt-and-braces

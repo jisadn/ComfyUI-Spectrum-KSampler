@@ -53,6 +53,9 @@
       },
       "clip": {
         "tooltip": "quality tag を encode する CLIP です。mod guidance を使う場合に接続します。"
+      },
+      "xattn_boost": {
+        "tooltip": "フロントロード cross-attn ブースト λ。1.0 はオフ（完全一致）。高 σ（プラン生成の区間）で条件付き forward の cross-attn 残差を λ 倍し、弱いタグの反映や関係・属性のバインディングを強めます（描画スタイルは維持）。推奨 1.5、最大 3.0（大きいほど全体的な彩度がわずかに低下し、フレーミング/クロップなど不要なタグも増幅されることがあります）。実際の forward のみブーストし、forecast ステップはブースト済み特徴から外挿します。SMC-CFG / CFG++ / FSG / mod-guidance と併用可能です。"
       }
     }
   },
@@ -176,6 +179,12 @@
       },
       "smc_cfg_lambda": {
         "tooltip": "SMC-CFG sliding-manifold slope lambda です。"
+      },
+      "xattn_boost": {
+        "tooltip": "フロントロード cross-attn ブースト λ。1.0 はオフ（完全一致）。高 σ（プラン生成の区間）で条件付き forward の cross-attn 残差を λ 倍し、弱いタグの反映や関係・属性のバインディングを強めます（描画スタイルは維持）。推奨 1.5、最大 3.0（大きいほど全体的な彩度がわずかに低下し、フレーミング/クロップなど不要なタグも増幅されることがあります）。実際の forward のみブーストし、forecast ステップはブースト済み特徴から外挿します。SMC-CFG / CFG++ / FSG / mod-guidance と併用可能です。"
+      },
+      "xattn_boost_band": {
+        "tooltip": "cross-attn ブーストの σ カットオフ（σ ≥ band で作動）。デフォルト 0.85 = cross-attn 駆動の下限 σ（28 ステップ中およそ 10 ステップ）。0.95 側に上げると高 σ の区間のみ狭く適用されます。約 0.85 未満では増幅すべきテキスト駆動がほぼ残りません。xattn_boost=1.0 のときは無視されます。"
       }
     }
   },

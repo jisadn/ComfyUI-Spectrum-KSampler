@@ -53,6 +53,9 @@
       },
       "clip": {
         "tooltip": "quality tag를 encode할 CLIP입니다. mod guidance를 사용할 때 연결합니다."
+      },
+      "xattn_boost": {
+        "tooltip": "프론트로드 cross-attn 부스트 λ입니다. 1.0은 끔(완전 동일). 높은 σ(플랜 작성 구간)에서 조건부 forward의 cross-attn residual을 λ배로 키워 약한 태그 반영과 관계/속성 바인딩을 강화하며 렌더 스타일은 유지합니다. 1.5 권장, 최대 3.0(높을수록 전역 채도가 약간 낮아지고 프레이밍/크롭 등 원치 않는 캡션 태그도 증폭될 수 있음). 실제 forward만 부스트하고 forecast 스텝은 부스트된 특징에서 외삽합니다. SMC-CFG / CFG++ / FSG / mod-guidance와 함께 사용할 수 있습니다."
       }
     }
   },
@@ -176,6 +179,12 @@
       },
       "smc_cfg_lambda": {
         "tooltip": "SMC-CFG sliding-manifold slope lambda입니다."
+      },
+      "xattn_boost": {
+        "tooltip": "프론트로드 cross-attn 부스트 λ입니다. 1.0은 끔(완전 동일). 높은 σ(플랜 작성 구간)에서 조건부 forward의 cross-attn residual을 λ배로 키워 약한 태그 반영과 관계/속성 바인딩을 강화하며 렌더 스타일은 유지합니다. 1.5 권장, 최대 3.0(높을수록 전역 채도가 약간 낮아지고 프레이밍/크롭 등 원치 않는 캡션 태그도 증폭될 수 있음). 실제 forward만 부스트하고 forecast 스텝은 부스트된 특징에서 외삽합니다. SMC-CFG / CFG++ / FSG / mod-guidance와 함께 사용할 수 있습니다."
+      },
+      "xattn_boost_band": {
+        "tooltip": "cross-attn 부스트의 σ 컷오프입니다(σ ≥ band에서 작동). 기본 0.85 = cross-attn 구동 하한 σ(28스텝 기준 약 10스텝). 0.95 쪽으로 올리면 고-σ 구간만 좁게 적용됩니다. 약 0.85 아래에서는 증폭할 텍스트 구동력이 거의 없습니다. xattn_boost=1.0이면 무시됩니다."
       }
     }
   },

@@ -435,6 +435,49 @@ _SMC_CFG_LAMBDA_INPUT = (
     },
 )
 
+# Front-loaded cross-attn boost (--xattn_boost). One dial: λ scales the
+# cross-attn residual on the cond forward at high σ (the plan-writing window),
+# lifting weak-tag / relation-binding adherence. 1.0 = off. Band lives on the
+# Advanced node only. See anima_lora/docs/inference/xattn_boost.md.
+_XATTN_BOOST_INPUT = (
+    "FLOAT",
+    {
+        "default": 1.0,
+        "min": 1.0,
+        "max": 3.0,
+        "step": 0.05,
+        "round": 0.01,
+        "tooltip": (
+            "Front-loaded cross-attn boost λ. 1.0 = off (exact identity). "
+            "Scales every block's cross-attn residual on the conditional "
+            "forward at high σ (the plan-writing window where text drive lives), "
+            "strengthening weak-tag adherence and relation/attribute bindings "
+            "without changing the render style. ~1.5 recommended; up to 3.0 for "
+            "stubborn tags (higher λ costs a mild global desaturation and can "
+            "amplify unwanted caption tags like framing/crop priors). Boosts "
+            "only actual forwards; forecast steps extrapolate from the boosted "
+            "features. Composes with SMC-CFG / CFG++ / FSG / mod-guidance."
+        ),
+    },
+)
+_XATTN_BOOST_BAND_INPUT = (
+    "FLOAT",
+    {
+        "default": 0.85,
+        "min": 0.0,
+        "max": 1.0,
+        "step": 0.01,
+        "round": 0.001,
+        "tooltip": (
+            "σ cutoff for the cross-attn boost (fires at σ ≥ band). Default "
+            "0.85 = the cross-attn drive-floor σ (~10 of 28 shifted-schedule "
+            "steps). Raise toward 0.95 for a tighter high-σ-only window; below "
+            "~0.85 the boost has little text drive left to amplify. Ignored when "
+            "xattn_boost = 1.0."
+        ),
+    },
+)
+
 # DCW: SNR-t bias correction (arXiv:2604.16044). Anima form, λ < 0,
 # schedule fixed to one_minus_sigma. See anima_lora/docs/methods/dcw.md.
 # Exposed on the Advanced sampler and the standalone DiT CFG-FSG/DCW patcher.
@@ -859,6 +902,7 @@ class SpectrumKSampler:
                 **_MOD_PROFILE_INPUTS,
                 "refresh_ratio": _REFRESH_RATIO_INPUT,
                 "adaptive_smc_alpha": _SMC_CFG_ALPHA_INPUT,
+                "xattn_boost": _XATTN_BOOST_INPUT,
                 "fsg": (
                     "BOOLEAN",
                     {
@@ -916,6 +960,7 @@ class SpectrumKSampler:
         clip=None,
         denoise=1.0,
         adaptive_smc_alpha=_SMC_CFG_ALPHA_DEFAULT,
+        xattn_boost=1.0,
     ):
         m = _apply_mod_profile(
             model,
@@ -949,6 +994,7 @@ class SpectrumKSampler:
             smc_alpha=smc_alpha,
             schedule=schedule,
             refresh_ratio=refresh_ratio,
+            xattn_boost=xattn_boost,
             **fsg_extra,
         )
 
@@ -967,6 +1013,8 @@ class SpectrumKSamplerAdvanced:
                 **_FSG_INPUTS,
                 "adaptive_smc_alpha": _SMC_CFG_ALPHA_INPUT,
                 "smc_cfg_lambda": _SMC_CFG_LAMBDA_INPUT,
+                "xattn_boost": _XATTN_BOOST_INPUT,
+                "xattn_boost_band": _XATTN_BOOST_BAND_INPUT,
             }
         }
 
@@ -1023,6 +1071,8 @@ class SpectrumKSamplerAdvanced:
         fsg_gamma=0.0,
         adaptive_smc_alpha=_SMC_CFG_ALPHA_DEFAULT,
         smc_cfg_lambda=_SMC_CFG_LAMBDA_DEFAULT,
+        xattn_boost=1.0,
+        xattn_boost_band=0.85,
     ):
         m = _apply_mod_guidance(
             model,
@@ -1069,6 +1119,8 @@ class SpectrumKSamplerAdvanced:
             fsg_k=fsg_k,
             fsg_d_sigma=fsg_d_sigma,
             fsg_gamma=fsg_gamma,
+            xattn_boost=xattn_boost,
+            xattn_boost_band=xattn_boost_band,
         )
 
 
