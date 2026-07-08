@@ -33,7 +33,17 @@ import torch
 
 import folder_paths
 
-from library.inference.corrections.dcw_calibrator import OnlineDCWCalibrator
+# The fusion-head calibrator (DCW ``auto`` mode) lived in anima_lora, but the
+# DCW line — including the trainable adjuster — was retired from that repo
+# (archived 2026-07-05). The heavyweight ceiling-capped fusion head is NOT
+# vendored here; ``auto`` mode therefore degrades to manual DCW when the class
+# is unavailable (``setup_dcw_calibrator`` returns None → ``install_dcw`` falls
+# back to the scalar ``dcw_lambda`` × schedule path). Manual DCW is fully
+# self-contained (see ``dcw.py``) and unaffected.
+try:
+    from library.inference.corrections.dcw_calibrator import OnlineDCWCalibrator
+except ImportError:
+    OnlineDCWCalibrator = None
 
 from .mod_guidance import _extract_raw_and_t5
 
@@ -179,6 +189,14 @@ def setup_dcw_calibrator(
     dropped tokens), which matches the trainer's ``attn_mask_v0`` to within the
     cap_len aux-feature tolerance.
     """
+    if OnlineDCWCalibrator is None:
+        logger.warning(
+            "DCW calibrator (auto mode) is unavailable — the fusion-head "
+            "calibrator was retired from anima_lora and is not vendored in this "
+            "node. Falling back to manual DCW (dcw_lambda × schedule)."
+        )
+        return None
+
     try:
         path = _resolve_calibrator_path(calibrator_name)
     except Exception as e:
