@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import inspect
 import logging
 import math
 from typing import Dict, Hashable, List, Optional, Sequence
@@ -609,6 +610,243 @@ def _ensure_xattn_gain_patch(dit) -> bool:
     return True
 
 
+# --- Norm-matched gain (anima_lora Phase-1'' `--xattn_boost_renorm`) --------
+#
+# The raw residual gain pushes hidden states off the norm distribution the
+# next block was trained on (mixture-OOD → saturation burn / framing drift on
+# complex prompts). The shipped fix rescales the post-cross-attn state back
+# toward the norm it would have had at gain 1.0, so the boost becomes a
+# *rotation toward the cross-attn direction* on (near) the trained norm shell.
+# `img` mode (shipped default, ρ 0.5) matches the per-image MEAN token norm —
+# the token-norm distribution keeps its peaks (neon / highlights / speculars);
+# `tok` matches every token individually (clamps exactly those peaks → grey
+# tone; bench reference only). ρ applies scale**ρ (1.0 full shell, 0.0 raw).
+#
+# The renorm needs `plain = result·gate + x` at the residual-add site inside
+# Block.forward, which the cross_attn-level patch can't see — so it rides a
+# second, opt-in patch that replaces each Block's `forward` with a faithful
+# mirror of comfy predict2's (bit-identical when neutral) plus the gain +
+# renorm at the cross-attn residual add. Same compile discipline as the
+# cross_attn patch: the gain is a non-persistent buffer (per-step retune via
+# copy_ with no recompile); the renorm flags are plain Python attrs (static
+# dynamo guards — at most two graph variants, boosted / identity, both cached
+# after first trace). When the block patch is armed, the cross_attn-level
+# buffer is held at identity so the gain is never applied twice; renorm='off'
+# keeps the original cross_attn-only path byte-for-byte untouched.
+#
+# The block mirror pins comfy's Block.forward signature. If upstream drifts,
+# `_ensure_xattn_block_patch` refuses to install (signature + submodule
+# check), logs, and the boost falls back to the raw-gain path — never a crash
+# or a silently divergent forward.
+
+_BLOCK_FORWARD_PARAMS = (
+    "self",
+    "x_B_T_H_W_D",
+    "emb_B_T_D",
+    "crossattn_emb",
+    "rope_emb_L_1_1_D",
+    "adaln_lora_B_T_3D",
+    "extra_per_block_pos_emb",
+    "transformer_options",
+)
+_BLOCK_SUBMODULES = (
+    "layer_norm_self_attn",
+    "self_attn",
+    "layer_norm_cross_attn",
+    "cross_attn",
+    "layer_norm_mlp",
+    "mlp",
+    "adaln_modulation_self_attn",
+    "adaln_modulation_cross_attn",
+    "adaln_modulation_mlp",
+)
+
+
+def _make_norm_matched_block_forward(block):
+    """Mirror of comfy predict2 ``Block.forward`` + norm-matched cross-attn gain.
+
+    Bit-identical to upstream when neutral (gain buffer = 1, renorm off — the
+    extra multiply by exactly 1.0 and the skipped renorm branch change no
+    bits). Plain reshape/indexing replaces upstream's einops rearranges
+    (same memory layout, bit-identical).
+    """
+
+    def _block_forward(
+        x_B_T_H_W_D,
+        emb_B_T_D,
+        crossattn_emb,
+        rope_emb_L_1_1_D=None,
+        adaln_lora_B_T_3D=None,
+        extra_per_block_pos_emb=None,
+        transformer_options={},
+    ):
+        residual_dtype = x_B_T_H_W_D.dtype
+        compute_dtype = emb_B_T_D.dtype
+        if extra_per_block_pos_emb is not None:
+            x_B_T_H_W_D = x_B_T_H_W_D + extra_per_block_pos_emb
+
+        if block.use_adaln_lora:
+            shift_sa_B_T_D, scale_sa_B_T_D, gate_sa_B_T_D = (
+                block.adaln_modulation_self_attn(emb_B_T_D) + adaln_lora_B_T_3D
+            ).chunk(3, dim=-1)
+            shift_ca_B_T_D, scale_ca_B_T_D, gate_ca_B_T_D = (
+                block.adaln_modulation_cross_attn(emb_B_T_D) + adaln_lora_B_T_3D
+            ).chunk(3, dim=-1)
+            shift_mlp_B_T_D, scale_mlp_B_T_D, gate_mlp_B_T_D = (
+                block.adaln_modulation_mlp(emb_B_T_D) + adaln_lora_B_T_3D
+            ).chunk(3, dim=-1)
+        else:
+            shift_sa_B_T_D, scale_sa_B_T_D, gate_sa_B_T_D = (
+                block.adaln_modulation_self_attn(emb_B_T_D).chunk(3, dim=-1)
+            )
+            shift_ca_B_T_D, scale_ca_B_T_D, gate_ca_B_T_D = (
+                block.adaln_modulation_cross_attn(emb_B_T_D).chunk(3, dim=-1)
+            )
+            shift_mlp_B_T_D, scale_mlp_B_T_D, gate_mlp_B_T_D = (
+                block.adaln_modulation_mlp(emb_B_T_D).chunk(3, dim=-1)
+            )
+
+        # (B, T, D) -> (B, T, 1, 1, D) broadcast shape.
+        shift_sa = shift_sa_B_T_D[:, :, None, None, :]
+        scale_sa = scale_sa_B_T_D[:, :, None, None, :]
+        gate_sa = gate_sa_B_T_D[:, :, None, None, :]
+        shift_ca = shift_ca_B_T_D[:, :, None, None, :]
+        scale_ca = scale_ca_B_T_D[:, :, None, None, :]
+        gate_ca = gate_ca_B_T_D[:, :, None, None, :]
+        shift_mlp = shift_mlp_B_T_D[:, :, None, None, :]
+        scale_mlp = scale_mlp_B_T_D[:, :, None, None, :]
+        gate_mlp = gate_mlp_B_T_D[:, :, None, None, :]
+
+        B, T, H, W, D = x_B_T_H_W_D.shape
+
+        def _norm_mod(_x, _norm_layer, _scale, _shift):
+            return _norm_layer(_x) * (1 + _scale) + _shift
+
+        normalized = _norm_mod(
+            x_B_T_H_W_D, block.layer_norm_self_attn, scale_sa, shift_sa
+        )
+        result = block.self_attn(
+            normalized.to(compute_dtype).reshape(B, T * H * W, D),
+            None,
+            rope_emb=rope_emb_L_1_1_D,
+            transformer_options=transformer_options,
+        ).reshape(B, T, H, W, D)
+        x_B_T_H_W_D = x_B_T_H_W_D + gate_sa.to(residual_dtype) * result.to(
+            residual_dtype
+        )
+
+        normalized = _norm_mod(
+            x_B_T_H_W_D, block.layer_norm_cross_attn, scale_ca, shift_ca
+        )
+        result = block.cross_attn(
+            normalized.to(compute_dtype).reshape(B, T * H * W, D),
+            crossattn_emb,
+            rope_emb=rope_emb_L_1_1_D,
+            transformer_options=transformer_options,
+        ).reshape(B, T, H, W, D)
+
+        # Norm-matched cross-attn boost. `_xattn_gain` is (B,1,1,1,1) — λ on
+        # cond rows, 1.0 on uncond rows, so on uncond rows plain == boosted and
+        # the renorm scale is exactly 1 (no per-row branching needed).
+        gated = result.to(residual_dtype) * gate_ca.to(residual_dtype)
+        x_new = gated * block._xattn_gain.to(residual_dtype) + x_B_T_H_W_D
+        if block._xattn_renorm:
+            plain = gated + x_B_T_H_W_D
+            norm_plain = plain.float().norm(dim=-1, keepdim=True)
+            norm_new = x_new.float().norm(dim=-1, keepdim=True).clamp_min(1e-6)
+            if not block._xattn_renorm_pertoken:
+                norm_plain = norm_plain.mean(dim=(1, 2, 3), keepdim=True)
+                norm_new = norm_new.mean(dim=(1, 2, 3), keepdim=True)
+            scale = norm_plain / norm_new
+            if block._xattn_renorm_frac != 1.0:
+                scale = scale**block._xattn_renorm_frac
+            x_new = x_new * scale.to(x_new.dtype)
+        x_B_T_H_W_D = x_new
+
+        normalized = _norm_mod(
+            x_B_T_H_W_D, block.layer_norm_mlp, scale_mlp, shift_mlp
+        )
+        result = block.mlp(normalized.to(compute_dtype))
+        x_B_T_H_W_D = x_B_T_H_W_D + gate_mlp.to(residual_dtype) * result.to(
+            residual_dtype
+        )
+        return x_B_T_H_W_D
+
+    return _block_forward
+
+
+def _ensure_xattn_block_patch(dit) -> bool:
+    """Install the norm-matched Block.forward mirror on every block (once).
+
+    Refuses (returns False, logs a warning) when the blocks don't match the
+    comfy predict2 Block contract this mirror was written against — signature
+    drift, missing submodules, or an already-monkeypatched forward — so the
+    caller falls back to the raw-gain path instead of running a silently
+    divergent forward.
+    """
+    if getattr(dit, "_xattn_block_patched", False):
+        return True
+
+    blocks = getattr(dit, "blocks", None)
+    if not blocks:
+        logger.warning(
+            "Spectrum xattn renorm: DiT has no blocks to patch; "
+            "falling back to the raw gain."
+        )
+        return False
+
+    try:
+        params = tuple(inspect.signature(type(blocks[0]).forward).parameters)
+    except (TypeError, ValueError):
+        params = ()
+    if params != _BLOCK_FORWARD_PARAMS:
+        logger.warning(
+            "Spectrum xattn renorm: Block.forward signature %s does not match "
+            "the predict2 contract this node mirrors %s (ComfyUI updated?); "
+            "falling back to the raw gain. Update the Spectrum node.",
+            params,
+            _BLOCK_FORWARD_PARAMS,
+        )
+        return False
+    for block in blocks:
+        if any(not hasattr(block, name) for name in _BLOCK_SUBMODULES) or not hasattr(
+            block, "use_adaln_lora"
+        ):
+            logger.warning(
+                "Spectrum xattn renorm: block is missing expected predict2 "
+                "submodules; falling back to the raw gain."
+            )
+            return False
+        if "forward" in block.__dict__:
+            logger.warning(
+                "Spectrum xattn renorm: another patch already replaced "
+                "Block.forward; falling back to the raw gain."
+            )
+            return False
+
+    for block in blocks:
+        # Same float-param pin as the cross_attn patch: on W8A8-quantized
+        # models an int8-derived buffer would truncate λ to a silent no-op.
+        dev, dt = None, torch.float32
+        for p in block.cross_attn.parameters():
+            if dev is None:
+                dev = p.device
+            if p.dtype.is_floating_point:
+                dev, dt = p.device, p.dtype
+                break
+        block.register_buffer(
+            "_xattn_gain",
+            torch.ones((1, 1, 1, 1, 1), device=dev, dtype=dt),
+            persistent=False,
+        )
+        block._xattn_renorm = False
+        block._xattn_renorm_pertoken = False
+        block._xattn_renorm_frac = 1.0
+        block.forward = _make_norm_matched_block_forward(block)
+    dit._xattn_block_patched = True
+    return True
+
+
 def _xattn_gain_vector(cond_or_uncond, batch_size, boost, device, dtype):
     """Build a ``(B, 1, 1)`` per-sample gain: λ on cond chunks, 1.0 on uncond.
 
@@ -628,50 +866,110 @@ def _xattn_gain_vector(cond_or_uncond, batch_size, boost, device, dtype):
     return gains
 
 
-def _set_xattn_gain(dit, cond_or_uncond, batch_size, boost, band, sigma_val):
-    """Write the per-block cross-attn gain buffers for one actual forward.
+def _write_gain_buffer(module, target):
+    """Write a gain buffer in place when the shape matches (no recompile);
+    reallocate only on a batch-size change (one recompile)."""
+    buf = module._xattn_gain
+    if buf.shape == target.shape:
+        buf.copy_(target)
+    else:
+        module._xattn_gain = target
 
-    Sets a ``(B, 1, 1)`` buffer on every ``cross_attn``: the boosted λ-vector
-    when ``sigma_val >= band``, else identity ones (still shaped ``(B, 1, 1)`` so
-    the buffer shape — and thus the compiled block graph — stays fixed across
-    boosted / unboosted steps). Reuses the existing buffer in place (``copy_``)
-    when the shape matches, so no recompile; only a batch-size change reallocates
-    (one recompile). Returns True when a boost was actually applied.
+
+def _set_xattn_gain(
+    dit,
+    cond_or_uncond,
+    batch_size,
+    boost,
+    band,
+    sigma_val,
+    renorm_mode="off",
+    renorm_frac=1.0,
+):
+    """Write the per-block cross-attn gain state for one actual forward.
+
+    Raw path (``renorm_mode='off'`` or block patch unavailable): the λ-vector
+    lands in each ``cross_attn``'s ``(B, 1, 1)`` buffer, exactly as before.
+    Norm-matched path: the λ-vector lands in each Block's ``(B, 1, 1, 1, 1)``
+    buffer read at the residual-add site, the cross_attn buffers are held at
+    identity (never boost twice), and the renorm flags are armed. Off-band
+    steps write identity into both (buffer shape — and thus the compiled block
+    graph — stays fixed across boosted / unboosted steps). Returns True when a
+    boost was actually applied.
     """
     blocks = dit.blocks
+    block_patched = getattr(dit, "_xattn_block_patched", False)
+    use_block_path = renorm_mode != "off" and block_patched
     ref = blocks[0].cross_attn._xattn_gain
     gain_vec = None
     if sigma_val >= band:
         gain_vec = _xattn_gain_vector(
             cond_or_uncond, batch_size, boost, ref.device, ref.dtype
         )
+    renorm_on = use_block_path and gain_vec is not None
     for block in blocks:
         ca = block.cross_attn
         buf = ca._xattn_gain
-        if gain_vec is None:
-            target = torch.ones((batch_size, 1, 1), device=buf.device, dtype=buf.dtype)
+        if gain_vec is None or use_block_path:
+            ca_target = torch.ones(
+                (batch_size, 1, 1), device=buf.device, dtype=buf.dtype
+            )
         else:
-            target = gain_vec.to(device=buf.device, dtype=buf.dtype)
-        if buf.shape == target.shape:
-            buf.copy_(target)
-        else:
-            ca._xattn_gain = target  # batch-size change → one recompile
+            ca_target = gain_vec.to(device=buf.device, dtype=buf.dtype)
+        _write_gain_buffer(ca, ca_target)
+        if block_patched:
+            bbuf = block._xattn_gain
+            if renorm_on:
+                blk_target = gain_vec.view(batch_size, 1, 1, 1, 1).to(
+                    device=bbuf.device, dtype=bbuf.dtype
+                )
+            else:
+                blk_target = torch.ones(
+                    (batch_size, 1, 1, 1, 1), device=bbuf.device, dtype=bbuf.dtype
+                )
+            _write_gain_buffer(block, blk_target)
+            block._xattn_renorm = renorm_on
+            block._xattn_renorm_pertoken = renorm_mode == "tok"
+            block._xattn_renorm_frac = float(renorm_frac) if renorm_on else 1.0
     return gain_vec is not None
 
 
-def _reset_xattn_gain(dit) -> None:
+def _reset_xattn_gain(dit, neutral_shape: bool = False) -> None:
     """Neutralize the cross-attn gain buffers to exact identity (in place).
 
     Keeps the patch installed (so no recompile) but makes it a no-op — used
     after each forward and at teardown so a leftover boost never bleeds into a
     later step or another sampler sharing the DiT.
+
+    ``neutral_shape`` (teardown only): also restore the buffers to their
+    all-ones broadcast shape. The per-forward reset keeps the batch shape
+    (fill_ in place — the compiled graph's shape guard stays satisfied), but a
+    batch-shaped buffer left behind at run end would broadcast-error a later
+    sampler running a *different* batch size through the patched forwards.
     """
     if not getattr(dit, "_xattn_gain_patched", False):
         return
+    block_patched = getattr(dit, "_xattn_block_patched", False)
     for block in dit.blocks:
-        buf = getattr(block.cross_attn, "_xattn_gain", None)
+        ca = block.cross_attn
+        buf = getattr(ca, "_xattn_gain", None)
         if buf is not None:
-            buf.fill_(1.0)
+            if neutral_shape and buf.shape != (1, 1, 1):
+                ca._xattn_gain = torch.ones(
+                    (1, 1, 1), device=buf.device, dtype=buf.dtype
+                )
+            else:
+                buf.fill_(1.0)
+        if block_patched:
+            bbuf = block._xattn_gain
+            if neutral_shape and bbuf.shape != (1, 1, 1, 1, 1):
+                block._xattn_gain = torch.ones(
+                    (1, 1, 1, 1, 1), device=bbuf.device, dtype=bbuf.dtype
+                )
+            else:
+                bbuf.fill_(1.0)
+            block._xattn_renorm = False
+            block._xattn_renorm_frac = 1.0
 
 
 def _resolve_live_components(apply_model, fallback_dit, fallback_model_sampling, state):
@@ -1050,6 +1348,8 @@ def spectrum_sample(
     fsg_gamma: float = 0.0,
     xattn_boost: float = 1.0,
     xattn_boost_band: float = 0.85,
+    xattn_boost_renorm: str = "img",
+    xattn_boost_renorm_frac: float = 0.5,
     compat_policy: str = DEFAULT_COMPAT_POLICY,
 ):
     """Shared Spectrum sampling logic used by all node tiers.
@@ -1115,6 +1415,19 @@ def spectrum_sample(
     xattn_boost_band: σ cutoff for xattn_boost (boost fires at σ ≥ band).
         Default 0.85 = the cross-attn drive-floor σ (~10 of 28 shifted-schedule
         steps). Raise for a tighter high-σ-only window.
+    xattn_boost_renorm: Norm matching for the boost (anima Phase-1''; shipped
+        default 'img'). 'img' rescales the post-cross-attn hidden state so the
+        per-image MEAN token norm stays on its gain-1 shell — the boost becomes
+        a rotation toward the cross-attn direction instead of an unconstrained
+        residual add, killing the saturation-burn / framing-drift failure of
+        the raw gain while keeping the token-norm peaks that carry highlights.
+        'tok' matches every token individually (flattens exactly those peaks →
+        grey tone; bench reference only). 'off' = raw pre-renorm gain.
+        Needs the predict2 Block contract; falls back to 'off' with a warning
+        on structure drift. Inert while xattn_boost = 1.0.
+    xattn_boost_renorm_frac: Partial-correction exponent ρ (scale**ρ);
+        1.0 = full shell match, 0.0 = raw boost. 0.5 at λ 2 was the Phase-1''
+        tone sweet spot.
     """
     compat_policy = _normalize_compat_policy(compat_policy)
     m = model.clone()
@@ -1312,14 +1625,26 @@ def spectrum_sample(
     xattn_boost_active = xattn_boost is not None and not math.isclose(
         float(xattn_boost), 1.0
     )
+    xattn_renorm_mode = str(xattn_boost_renorm or "off").lower()
+    if xattn_renorm_mode not in ("off", "tok", "img"):
+        logger.warning(
+            "Spectrum xattn boost: unknown renorm mode %r; using 'img'.",
+            xattn_boost_renorm,
+        )
+        xattn_renorm_mode = "img"
     if xattn_boost_active:
         xattn_boost_active = _ensure_xattn_gain_patch(dit)
+        if xattn_boost_active and xattn_renorm_mode != "off":
+            if not _ensure_xattn_block_patch(dit):
+                xattn_renorm_mode = "off"  # raw-gain fallback (warned inside)
         if xattn_boost_active:
             logger.info(
-                "Spectrum xattn boost active: λ=%.3g at σ ≥ %.3g (cond forward "
-                "only, compile-safe buffer path).",
+                "Spectrum xattn boost active: λ=%.3g at σ ≥ %.3g, renorm=%s ρ=%.2g "
+                "(cond forward only, compile-safe buffer path).",
                 float(xattn_boost),
                 float(xattn_boost_band),
+                xattn_renorm_mode,
+                float(xattn_boost_renorm_frac),
             )
 
     old_wrapper = m.model_options.get("model_function_wrapper")
@@ -1401,6 +1726,8 @@ def spectrum_sample(
                 float(xattn_boost),
                 float(xattn_boost_band),
                 sigma_val,
+                renorm_mode=xattn_renorm_mode,
+                renorm_frac=float(xattn_boost_renorm_frac),
             )
         try:
             if old_wrapper is not None:
@@ -1513,7 +1840,7 @@ def spectrum_sample(
     finally:
         dit.final_layer._spectrum_state = None
         if xattn_boost_active:
-            _reset_xattn_gain(dit)
+            _reset_xattn_gain(dit, neutral_shape=True)
         if hasattr(dit, "_mod_pooled_proj"):
             del dit._mod_pooled_proj
         # Drop this run's wrapper from the transient clone. Belt-and-braces

@@ -185,6 +185,12 @@
       },
       "xattn_boost_band": {
         "tooltip": "cross-attn 增强的 σ 截断（在 σ ≥ band 时生效）。默认 0.85 = cross-attn 驱动的下限 σ（28 步中约 10 步）。调高到 0.95 可只在高 σ 区间窄范围应用。低于约 0.85 时几乎没有可放大的文本驱动。当 xattn_boost=1.0 时忽略。"
+      },
+      "xattn_boost_renorm": {
+        "tooltip": "cross-attn 增益的范数匹配模式（默认 'img'）。原始增益会把 hidden state 推离下一个 block 训练时的范数分布（复杂提示词下出现饱和度烧灼/构图漂移）。'img' 会重新缩放 cross-attn 之后的状态，使每张图的平均 token 范数保持在未增益时的水平——增益变成朝文本方向的旋转，同时保留承载高光/霓虹的 token 范数峰值。'tok' 逐 token 匹配，恰好压平这些峰值 → 灰暗色调（仅作参考）。'off' 为原始增益。xattn_boost=1.0 时忽略。"
+      },
+      "xattn_boost_renorm_frac": {
+        "tooltip": "部分范数匹配指数 ρ（scale**ρ）。1.0 = 完全匹配回未增益的范数壳，0.0 = 原始增益。λ 2 时 0.5 是经验证的色调最佳点。renorm='off' 时忽略。"
       }
     }
   },

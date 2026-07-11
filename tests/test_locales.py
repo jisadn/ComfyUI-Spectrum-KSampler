@@ -69,6 +69,8 @@ EXPECTED_INPUTS = {
         "smc_cfg_lambda",
         "xattn_boost",
         "xattn_boost_band",
+        "xattn_boost_renorm",
+        "xattn_boost_renorm_frac",
     },
     "SpectrumSPDKSampler": {
         "model",

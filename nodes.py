@@ -437,8 +437,10 @@ _SMC_CFG_LAMBDA_INPUT = (
 
 # Front-loaded cross-attn boost (--xattn_boost). One dial: λ scales the
 # cross-attn residual on the cond forward at high σ (the plan-writing window),
-# lifting weak-tag / relation-binding adherence. 1.0 = off. Band lives on the
-# Advanced node only. See anima_lora/docs/inference/xattn_boost.md.
+# lifting weak-tag / relation-binding adherence. 1.0 = off. Norm-matched by
+# default (anima Phase-1'' shipped point: renorm 'img' ρ0.5). Band + renorm
+# knobs live on the Advanced node only. See
+# anima_lora/docs/inference/xattn_boost.md.
 _XATTN_BOOST_INPUT = (
     "FLOAT",
     {
@@ -452,8 +454,10 @@ _XATTN_BOOST_INPUT = (
             "Scales every block's cross-attn residual on the conditional "
             "forward at high σ (the plan-writing window where text drive lives), "
             "strengthening weak-tag adherence and relation/attribute bindings "
-            "without changing the render style. ~1.5 recommended; up to 3.0 for "
-            "stubborn tags (higher λ costs a mild global desaturation and can "
+            "without changing the render style. Norm-matched by default (renorm "
+            "'img' ρ0.5 — tunable on the Advanced node) so the boosted state "
+            "stays on the trained norm shell instead of burning saturation. "
+            "~1.5 recommended; up to 3.0 for stubborn tags (higher λ can "
             "amplify unwanted caption tags like framing/crop priors). Boosts "
             "only actual forwards; forecast steps extrapolate from the boosted "
             "features. Composes with SMC-CFG / CFG++ / FSG / mod-guidance."
@@ -474,6 +478,38 @@ _XATTN_BOOST_BAND_INPUT = (
             "steps). Raise toward 0.95 for a tighter high-σ-only window; below "
             "~0.85 the boost has little text drive left to amplify. Ignored when "
             "xattn_boost = 1.0."
+        ),
+    },
+)
+_XATTN_BOOST_RENORM_INPUT = (
+    ["img", "tok", "off"],
+    {
+        "default": "img",
+        "tooltip": (
+            "Norm matching for the cross-attn boost (shipped default 'img'). "
+            "The raw gain pushes hidden states off the norm distribution the "
+            "next block was trained on (saturation burn / framing drift on "
+            "complex prompts); 'img' rescales the post-cross-attn state so the "
+            "per-image mean token norm stays on its unboosted shell — the boost "
+            "becomes a rotation toward the text direction, keeping the "
+            "token-norm peaks that carry highlights/neon. 'tok' matches every "
+            "token individually (clamps exactly those peaks → flat grey tone; "
+            "reference only). 'off' = raw gain. Inert while xattn_boost = 1.0."
+        ),
+    },
+)
+_XATTN_BOOST_RENORM_FRAC_INPUT = (
+    "FLOAT",
+    {
+        "default": 0.5,
+        "min": 0.0,
+        "max": 1.0,
+        "step": 0.05,
+        "round": 0.01,
+        "tooltip": (
+            "Partial norm-match exponent ρ (scale**ρ). 1.0 = full match back "
+            "to the unboosted norm shell, 0.0 = raw boost. 0.5 at λ 2 was the "
+            "validated tone sweet spot. Ignored when renorm = 'off'."
         ),
     },
 )
@@ -1015,6 +1051,8 @@ class SpectrumKSamplerAdvanced:
                 "smc_cfg_lambda": _SMC_CFG_LAMBDA_INPUT,
                 "xattn_boost": _XATTN_BOOST_INPUT,
                 "xattn_boost_band": _XATTN_BOOST_BAND_INPUT,
+                "xattn_boost_renorm": _XATTN_BOOST_RENORM_INPUT,
+                "xattn_boost_renorm_frac": _XATTN_BOOST_RENORM_FRAC_INPUT,
             }
         }
 
@@ -1073,6 +1111,8 @@ class SpectrumKSamplerAdvanced:
         smc_cfg_lambda=_SMC_CFG_LAMBDA_DEFAULT,
         xattn_boost=1.0,
         xattn_boost_band=0.85,
+        xattn_boost_renorm="img",
+        xattn_boost_renorm_frac=0.5,
     ):
         m = _apply_mod_guidance(
             model,
@@ -1121,6 +1161,8 @@ class SpectrumKSamplerAdvanced:
             fsg_gamma=fsg_gamma,
             xattn_boost=xattn_boost,
             xattn_boost_band=xattn_boost_band,
+            xattn_boost_renorm=xattn_boost_renorm,
+            xattn_boost_renorm_frac=xattn_boost_renorm_frac,
         )
 
 
