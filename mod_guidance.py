@@ -245,8 +245,12 @@ def _compute_t_emb(dit, t):
        dtype: in the APPLY_MODEL wrapper ``args[0]`` is still the sampler's fp32
        latent (the model casts it internally later), so x.dtype is wrong here."""
     te = dit.t_embedder
-    p = next(te[1].parameters(), None)
-    wdt = p.dtype if p is not None else t.dtype
+    # First FLOAT param: on W8A8-quantized models (ComfyUI-INT8-Fast) weight
+    # dtype can be int8 (t_embedder is float under its `anima` exclusion preset,
+    # but don't depend on that).
+    wdt = next(
+        (p.dtype for p in te[1].parameters() if p.dtype.is_floating_point), t.dtype
+    )
     t_bt = t.reshape(-1, 1) if t.ndim == 1 else t
     sin = te[0](t_bt)  # Timesteps -> fp32
     emb = te[1](sin.to(wdt))  # cast to embedder weight dtype, then its linears

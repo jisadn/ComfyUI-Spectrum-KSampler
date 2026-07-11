@@ -94,7 +94,15 @@ def _spectrum_fast_forward(
     # not match the model. Pin it to final_layer's weight dtype before re-entry
     # — otherwise fp16 models (e.g. `--fast fp16_accumulation`) raise
     # "mat1 and mat2 ... float != c10::Half". t_emb follows via the cast below.
-    model_dtype = next(dit.final_layer.parameters()).dtype
+    # Skip non-float params: W8A8-quantized models (e.g. ComfyUI-INT8-Fast)
+    # store final_layer.linear.weight as int8 — pinning to it would cast the
+    # feature to int8. Their AdaLN linears stay float and supply the dtype; a
+    # fully-quantized final_layer keeps the prediction dtype (the int8 Linear
+    # casts its input internally).
+    model_dtype = next(
+        (p.dtype for p in dit.final_layer.parameters() if p.dtype.is_floating_point),
+        predicted_feature.dtype,
+    )
     predicted_feature = predicted_feature.to(model_dtype)
     # Replicate the model's two-step t_embedder call: Timesteps (sinusoidal,
     # always float32) -> cast to model dtype -> TimestepEmbedding (linear layers).
@@ -582,11 +590,16 @@ def _ensure_xattn_gain_patch(dit) -> bool:
         ca = block.cross_attn
         if getattr(ca, "_xattn_gain_patched", False):
             continue
-        try:
-            p = next(ca.parameters())
-            dev, dt = p.device, p.dtype
-        except StopIteration:  # no params — fall back to defaults
-            dev, dt = None, torch.float32
+        # Buffer dtype must be floating-point: on W8A8-quantized models
+        # (e.g. ComfyUI-INT8-Fast) the attn projection weights are int8, and an
+        # int8 gain buffer would truncate λ (1.15 → 1 = silent no-op boost).
+        dev, dt = None, torch.float32
+        for p in ca.parameters():
+            if dev is None:
+                dev = p.device
+            if p.dtype.is_floating_point:
+                dev, dt = p.device, p.dtype
+                break
         ca.register_buffer(
             "_xattn_gain", torch.ones((1, 1, 1), device=dev, dtype=dt), persistent=False
         )
