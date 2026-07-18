@@ -461,6 +461,8 @@ def _t_emb_forward_hook(module, input, output):
     """
     delta = getattr(module, "_anima_mod_delta", None)
     if delta is not None:
+        tsw=output.shape[0]//delta.shape[0]
+        delta=delta.repeat(tsw, 1, 1)
         return output + delta
     return output
 
